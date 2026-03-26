@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "cron": {
+    "hour": 0,
+    "minute": 0
+  },
+  "timezone": "Asia/Shanghai"
+}
