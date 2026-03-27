@@ -20,8 +20,15 @@ class EmailNotifier:
         初始化邮件通知器
 
         Args:
-            config: 邮件配置字典，包含 smtp_server, smtp_port, sender_email, sender_password, receiver_email
+            config: 邮件配置字典
         """
+        # 检查是否启用邮件功能
+        self.enabled = config.get("enabled", True)
+
+        if not self.enabled:
+            logger.info("邮件通知功能已禁用")
+            return
+
         self.smtp_server = config["smtp_server"]
         self.smtp_port = config["smtp_port"]
         self.sender_email = config["sender_email"]
@@ -45,6 +52,10 @@ class EmailNotifier:
         Returns:
             发送成功返回 True，失败返回 False
         """
+        if not self.enabled:
+            logger.info("邮件通知已禁用，跳过发送")
+            return True
+
         subject = f"✅ Reddit 自媒体文章生成成功 - {article_title}"
 
         body = f"""
@@ -80,6 +91,10 @@ class EmailNotifier:
         Returns:
             发送成功返回 True，失败返回 False
         """
+        if not self.enabled:
+            logger.info("邮件通知已禁用，跳过发送")
+            return True
+
         subject = f"❌ Reddit 自媒体文章生成失败 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 
         body = f"""
@@ -142,6 +157,7 @@ Reddit 自媒体文章生成失败！
 if __name__ == "__main__":
     # 测试代码
     config = {
+        "enabled": False,  # 禁用邮件功能
         "smtp_server": "smtp.qq.com",
         "smtp_port": 587,
         "sender_email": "your_email@qq.com",

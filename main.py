@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.utils.config_loader import config_loader
 from src.collectors.reddit_collector import RedditCollector
 from src.generators.script_generator import ScriptGenerator
-from src.generators.music_generator import MusicGenerator
+from src.generators.music_generator import SunoMusicGenerator as MusicGenerator
 from src.generators.article_generator import ArticleGenerator
 from src.publishers.github_publisher import GitHubPublisher
 from src.publishers.email_notifier import EmailNotifier
