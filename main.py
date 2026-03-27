@@ -59,7 +59,21 @@ class RedditSunoAgent:
             # 初始化组件
             self.reddit_collector = RedditCollector(reddit_config)
             self.script_generator = ScriptGenerator(doubao_config["api_key"])
-            self.music_generator = MusicGenerator(suno_config["api_id"], suno_config["token"])
+
+            # 初始化音乐生成器（支持官方和非官方 API）
+            suno_api_type = suno_config.get("api_type", "unofficial")
+            if suno_api_type == "official":
+                self.music_generator = MusicGenerator(
+                    api_type="official",
+                    api_key=suno_config.get("api_key")
+                )
+            else:
+                self.music_generator = MusicGenerator(
+                    api_type="unofficial",
+                    api_id=suno_config.get("api_id"),
+                    token=suno_config.get("token")
+                )
+
             self.article_generator = ArticleGenerator()
             self.github_publisher = GitHubPublisher(github_config, project_dir=".")
             self.email_notifier = EmailNotifier(email_config)
@@ -91,11 +105,19 @@ class RedditSunoAgent:
             # 3. 生成背景音乐
             logger.info("步骤 3/6: 生成背景音乐...")
             music_idea = f"一首轻松愉快的电子音乐，适合作为'{title}'的背景音乐"
-            music_path = self.music_generator.generate_music(music_idea, style="electronic")
+            music_results = self.music_generator.generate_music(
+                prompt=music_idea,
+                style="electronic",
+                title=title[:80]  # 限制标题长度
+            )
 
-            if not music_path:
+            music_path = None
+            if music_results and len(music_results) > 0:
+                # 使用第一首音乐
+                music_path = music_results[0].get("local_path")
+                logger.info(f"音乐生成成功: {music_path}")
+            else:
                 logger.warning("音乐生成失败，继续生成文章（无背景音乐）")
-                music_path = None
 
             # 4. 生成 Markdown 文章
             logger.info("步骤 4/6: 生成 Markdown 文章...")
