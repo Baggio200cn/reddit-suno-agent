@@ -115,6 +115,18 @@ class ArticleGenerator:
                 content = post['selftext'][:500] + "..." if len(post['selftext']) > 500 else post['selftext']
                 lines.append(f"\n**内容**:\n{content}\n")
 
+            # 图片及中文描述（如果有）
+            image_descriptions = post.get('image_descriptions', [])
+            if image_descriptions:
+                lines.append(f"\n**配图内容**:\n")
+                for img_data in image_descriptions:
+                    url = img_data.get('url', '')
+                    desc = img_data.get('description', '')
+                    if url:
+                        lines.append(f"![配图]({url})\n")
+                    if desc:
+                        lines.append(f"> {desc}\n")
+
             # 原始链接
             lines.append(f"**🔗 原文链接**: {post['url']}\n")
 

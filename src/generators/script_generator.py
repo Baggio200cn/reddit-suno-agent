@@ -53,9 +53,13 @@ class ScriptGenerator:
 
         user_prompt = f"""请根据以下 Reddit 帖子标题，生成一个吸引人的文章标题：
 
-{titles_text}
+{titles_text}"""
 
-请生成标题："""
+        image_context = self._format_image_context(posts)
+        if image_context:
+            user_prompt += f"\n\n以下是帖子中图片的内容描述，可作为参考：\n{image_context}"
+
+        user_prompt += "\n\n请生成标题："
 
         try:
             response = self._call_api(system_prompt, user_prompt)
@@ -97,9 +101,13 @@ class ScriptGenerator:
 文章标题：{title}
 
 帖子内容：
-{posts_text}
+{posts_text}"""
 
-请生成摘要："""
+        image_context = self._format_image_context(posts)
+        if image_context:
+            user_prompt += f"\n\n以下是帖子中图片的内容描述，可作为参考：\n{image_context}"
+
+        user_prompt += "\n\n请生成摘要："
 
         try:
             response = self._call_api(system_prompt, user_prompt)
@@ -109,6 +117,21 @@ class ScriptGenerator:
         except Exception as e:
             logger.error(f"生成文章摘要失败: {e}")
             return "本期精选了 Reddit 上最热门的 AI 相关话题，带你了解最新趋势和深度思考。"
+
+    def _format_image_context(self, posts: List[Dict[str, Any]]) -> str:
+        """将帖子的图片描述整理为提示词中的文本块"""
+        lines = []
+        for i, post in enumerate(posts[:5], 1):
+            descriptions = post.get("image_descriptions", [])
+            for j, img in enumerate(descriptions):
+                desc = img.get("description")
+                if not desc:
+                    continue
+                if len(descriptions) == 1:
+                    lines.append(f"[帖子{i}配图描述]: {desc}")
+                else:
+                    lines.append(f"[帖子{i}配图{j+1}描述]: {desc}")
+        return "\n".join(lines)
 
     def _call_api(self, system_prompt: str, user_prompt: str) -> str:
         """
