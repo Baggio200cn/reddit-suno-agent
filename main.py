@@ -2,6 +2,7 @@
 主程序入口
 """
 import argparse
+import json
 import sys
 import os
 import logging
@@ -33,11 +34,21 @@ logger = logging.getLogger(__name__)
 
 
 class RedditSunoAgent:
+    def _load_desktop_paths(self):
+        try:
+            if os.path.exists("config/desktop_paths.json"):
+                with open("config/desktop_paths.json", "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except:
+            pass
+        return None
+
     """Reddit Suno 音乐自媒体代理"""
 
     def __init__(self):
         """初始化代理"""
         self.config = config_loader
+        self.desktop_paths = self._load_desktop_paths()
         self.reddit_collector = None
         self.script_generator = None
         self.music_generator = None
@@ -83,13 +94,24 @@ class RedditSunoAgent:
                     api_key=suno_config.get("api_key")
                 )
             else:
-                self.music_generator = MusicGenerator(
+                articles_dir = "output/articles"
+            music_dir = "output/music"
+            if self.desktop_paths:
+                articles_dir = self.desktop_paths["articles_dir"]
+                music_dir = self.desktop_paths["music_dir"]
+                print("使用桌面输出目录")
+            
+            os.makedirs(articles_dir, exist_ok=True)
+            os.makedirs(music_dir, exist_ok=True)
+            
+            self.music_generator = MusicGenerator(
                     api_type="unofficial",
                     api_id=suno_config.get("api_id"),
-                    token=suno_config.get("token")
+                    token=suno_config.get("token"),
+                    output_dir=music_dir
                 )
 
-            self.article_generator = ArticleGenerator()
+            self.article_generator = ArticleGenerator(output_dir=articles_dir)
             self.github_publisher = GitHubPublisher(github_config, project_dir=".")
             self.email_notifier = EmailNotifier(email_config)
 
