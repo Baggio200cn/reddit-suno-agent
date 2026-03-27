@@ -38,11 +38,15 @@ class ConfigLoader:
             with open(config_path, 'r', encoding='utf-8') as f:
                 self._credentials = json.load(f)
 
-            # 验证必需字段
-            required_sections = ["reddit", "suno", "doubao", "email", "github"]
+            # 验证必需字段（Reddit 现在使用 RSS Feed，无需配置）
+            required_sections = ["suno", "doubao", "email", "github"]
             for section in required_sections:
                 if section not in self._credentials:
                     raise ValueError(f"配置文件缺少必需的 section: {section}")
+
+            # 检查是否有 reddit 配置（为了兼容，不强制要求）
+            if "reddit" not in self._credentials:
+                self._credentials["reddit"] = {}  # 提供空配置
 
         return self._credentials
 
@@ -72,8 +76,13 @@ class ConfigLoader:
         return self._schedule
 
     def get_reddit_config(self) -> Dict[str, str]:
-        """获取 Reddit 配置"""
-        return self.load_credentials()["reddit"]
+        """
+        获取 Reddit 配置（现在使用 RSS Feed，无需凭证）
+
+        Returns:
+            空字典（保留接口以兼容）
+        """
+        return self.load_credentials().get("reddit", {})
 
     def get_suno_config(self) -> Dict[str, str]:
         """获取 Suno 配置"""
