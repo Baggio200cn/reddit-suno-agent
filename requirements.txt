@@ -1,7 +1,7 @@
-# Reddit RSS Feed（替代 PRAW）
-feedparser==6.0.10
+# Reddit RSS Feed（已替换为 JSON API，不再需要）
+# feedparser==6.0.10
 
-# HTTP 请求
+# HTTP 请求（用于 Reddit JSON API、豆包视觉 API 等）
 requests==2.31.0
 
 # 定时任务

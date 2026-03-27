@@ -17,6 +17,7 @@ from src.collectors.reddit_collector import RedditCollector
 from src.generators.script_generator import ScriptGenerator
 from src.generators.music_generator import SunoMusicGenerator as MusicGenerator
 from src.generators.article_generator import ArticleGenerator
+from src.processors.image_processor import ImageProcessor
 from src.publishers.github_publisher import GitHubPublisher
 from src.publishers.email_notifier import EmailNotifier
 
@@ -41,6 +42,7 @@ class RedditSunoAgent:
         self.script_generator = None
         self.music_generator = None
         self.article_generator = None
+        self.image_processor = None
         self.github_publisher = None
         self.email_notifier = None
 
@@ -59,6 +61,19 @@ class RedditSunoAgent:
             # 初始化组件
             self.reddit_collector = RedditCollector(reddit_config)
             self.script_generator = ScriptGenerator(doubao_config["api_key"])
+
+            # 初始化图片处理器（视觉模型，可选）
+            try:
+                vision_model = doubao_config.get("vision_model", "doubao-vision-pro-32k-241265")
+                proxy = reddit_config.get("proxy") or None
+                self.image_processor = ImageProcessor(
+                    api_key=doubao_config["api_key"],
+                    vision_model=vision_model,
+                    proxy=proxy,
+                )
+            except Exception as e:
+                logger.warning(f"图片处理器初始化失败，将跳过图片处理: {e}")
+                self.image_processor = None
 
             # 初始化音乐生成器（支持官方和非官方 API）
             suno_api_type = suno_config.get("api_type", "unofficial")
@@ -92,18 +107,30 @@ class RedditSunoAgent:
             logger.info("=" * 50)
 
             # 1. 搜集 Reddit 帖子
-            logger.info("步骤 1/6: 搜集 Reddit 帖子...")
+            logger.info("步骤 1/7: 搜集 Reddit 帖子...")
             posts = self.reddit_collector.collect_hot_posts("ThinkingDeeplyAI", limit=5)
             if not posts:
                 raise Exception("未能收集到任何帖子")
 
-            # 2. 生成文章标题和摘要
-            logger.info("步骤 2/6: 生成文章标题和摘要...")
+            # 2. 处理帖子图片（可选，失败不影响主流程）
+            logger.info("步骤 2/7: 处理帖子图片（视觉 AI 描述）...")
+            if self.image_processor:
+                try:
+                    posts = self.image_processor.process_posts(posts)
+                    image_count = sum(len(p.get("image_descriptions", [])) for p in posts)
+                    logger.info(f"成功处理 {image_count} 张图片描述")
+                except Exception as e:
+                    logger.warning(f"图片处理失败，继续生成文章（无图片描述）: {e}")
+            else:
+                logger.info("图片处理器未初始化，跳过图片处理")
+
+            # 3. 生成文章标题和摘要
+            logger.info("步骤 3/7: 生成文章标题和摘要...")
             title = self.script_generator.generate_article_title(posts)
             summary = self.script_generator.generate_article_summary(posts, title)
 
-            # 3. 生成背景音乐
-            logger.info("步骤 3/6: 生成背景音乐...")
+            # 4. 生成背景音乐
+            logger.info("步骤 4/7: 生成背景音乐...")
             music_idea = f"一首轻松愉快的电子音乐，适合作为'{title}'的背景音乐"
             music_results = self.music_generator.generate_music(
                 prompt=music_idea,
@@ -119,8 +146,8 @@ class RedditSunoAgent:
             else:
                 logger.warning("音乐生成失败，继续生成文章（无背景音乐）")
 
-            # 4. 生成 Markdown 文章
-            logger.info("步骤 4/6: 生成 Markdown 文章...")
+            # 5. 生成 Markdown 文章
+            logger.info("步骤 5/7: 生成 Markdown 文章...")
             article_path = self.article_generator.generate_article(
                 title=title,
                 summary=summary,
@@ -128,13 +155,13 @@ class RedditSunoAgent:
                 music_path=music_path
             )
 
-            # 5. 推送到 GitHub
-            logger.info("步骤 5/6: 推送到 GitHub...")
+            # 6. 推送到 GitHub
+            logger.info("步骤 6/7: 推送到 GitHub...")
             commit_message = f"发布文章: {title} - {datetime.now().strftime('%Y-%m-%d')}"
             self.github_publisher.push_to_github(commit_message)
 
-            # 6. 发送通知邮件
-            logger.info("步骤 6/6: 发送通知邮件...")
+            # 7. 发送通知邮件
+            logger.info("步骤 7/7: 发送通知邮件...")
             self.email_notifier.send_success_notification(
                 article_title=title,
                 article_path=article_path,
