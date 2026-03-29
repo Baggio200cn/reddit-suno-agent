@@ -88,16 +88,19 @@ def _make_session(proxy: str) -> requests.Session:
 # ═══════════════════════════════════════════════════════════════════
 
 def _fetch_listing(session: requests.Session, endpoint: str,
-                   params: dict = None) -> List[dict]:
-    """请求 Reddit 列表接口，返回 children 列表。"""
+                   params: dict = None) -> tuple:
+    """请求 Reddit 列表接口，返回 (children列表, after游标)。"""
     url = f"{_BASE_URL}{endpoint}"
     try:
         resp = session.get(url, params=params, timeout=20)
         resp.raise_for_status()
-        return resp.json().get("data", {}).get("children", [])
+        data = resp.json().get("data", {})
+        children = data.get("children", [])
+        after = data.get("after")  # 下一页游标，None 表示没有更多
+        return children, after
     except requests.exceptions.RequestException as e:
         logger.error(f"请求失败 {url}: {e}")
-        return []
+        return [], None
 
 
 def _fetch_single_post(session: requests.Session, post_id: str) -> Optional[dict]:
@@ -324,6 +327,41 @@ def _relevance_score(post: dict, keywords: List[str]) -> int:
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  历史去重
+# ═══════════════════════════════════════════════════════════════════
+
+def _load_seen_ids(base_dir: str) -> set:
+    """加载历史已抓取帖子 ID，避免重复。"""
+    seen_file = Path(base_dir) / "seen_posts.json"
+    if not seen_file.exists():
+        return set()
+    try:
+        with open(seen_file, encoding="utf-8") as f:
+            data = json.load(f)
+        return set(data.get("post_ids", []))
+    except Exception as e:
+        logger.warning(f"读取历史记录失败: {e}")
+        return set()
+
+
+def _save_seen_ids(base_dir: str, seen: set):
+    """保存已抓取帖子 ID（保留最近 200 条，防止文件无限增长）。"""
+    seen_file = Path(base_dir) / "seen_posts.json"
+    Path(base_dir).mkdir(parents=True, exist_ok=True)
+    # 只保留最新的 200 条
+    ids_list = list(seen)[-200:]
+    try:
+        with open(seen_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "post_ids": ids_list,
+                "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }, f, ensure_ascii=False, indent=2)
+        logger.info(f"历史记录已保存 ({len(ids_list)} 条): {seen_file}")
+    except Exception as e:
+        logger.warning(f"保存历史记录失败: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  主函数
 # ═══════════════════════════════════════════════════════════════════
 
@@ -345,61 +383,104 @@ def scrape(config: dict = None) -> List[Dict[str, Any]]:
     delay       = cfg.get("request_delay", 1.5)
     keywords    = [k.lower() for k in cfg.get("ai_keywords", [])]
 
-    # 输出目录
+    # 输出目录：按日期子目录
     date_str = datetime.now().strftime("%Y-%m-%d")
     if cfg.get("output_dir"):
-        output_dir = cfg["output_dir"]
+        base_dir   = cfg["output_dir"]          # 例：Desktop/Reddit_AI_资讯
+        output_dir = os.path.join(base_dir, date_str, "images")
     else:
-        output_dir = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "output", "images", date_str
-        )
+        base_dir   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+        output_dir = os.path.join(base_dir, date_str, "images")
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     logger.info(f"图片保存目录: {output_dir}")
 
+    # ── 加载历史记录（去重用）────────────────────────
+    seen_ids = _load_seen_ids(base_dir)
+    logger.info(f"历史记录中已有 {len(seen_ids)} 条帖子 ID，将跳过重复内容")
+
     session = _make_session(proxy)
 
-    # ── 1. 请求 Reddit 列表 ───────────────────────────
-    logger.info(f"正在从 r/{subreddit} 抓取 {mode} 帖子（扫描前25条）...")
+    # ── 分页抓取，直到凑足 limit 条新帖 ──────────────
     if mode == "top":
         endpoint = f"/r/{subreddit}/top.json"
-        params = {"limit": 25, "t": "day"}
+        base_params = {"limit": 25, "t": "week"}
     else:
         endpoint = f"/r/{subreddit}/hot.json"
-        params = {"limit": 25}
+        base_params = {"limit": 25}
 
-    children = _fetch_listing(session, endpoint, params)
-    if not children:
-        logger.error("未获取到任何帖子，请检查网络或代理设置")
+    selected: List[Dict[str, Any]] = []
+    selected_authors: set = set()
+    after_cursor = None
+    max_pages = 5  # 最多翻5页，防止无限循环
+
+    for page in range(max_pages):
+        params = dict(base_params)
+        if after_cursor:
+            params["after"] = after_cursor
+
+        logger.info(f"正在抓取第 {page + 1} 页（r/{subreddit} · {mode}）...")
+        children, after_cursor = _fetch_listing(session, endpoint, params)
+
+        if not children:
+            logger.warning("本页无数据，停止翻页")
+            break
+
+        logger.info(f"第 {page + 1} 页返回 {len(children)} 条，开始过滤...")
+
+        for child in children:
+            if len(selected) >= limit:
+                break
+            data = child.get("data", {})
+            post_id = data.get("id", "")
+            author  = data.get("author", "")
+
+            # ── 跳过已抓取过的帖子 ──────────────────
+            if post_id in seen_ids:
+                logger.debug(f"  跳过（已见过）: {post_id}")
+                time.sleep(0.05)
+                continue
+
+            # ── 跳过同作者帖子 ───────────────────────
+            if author and author in selected_authors:
+                logger.debug(f"  跳过（作者重复 u/{author}）")
+                time.sleep(0.05)
+                continue
+
+            post = _extract_post(data, session, delay)
+            if not post:
+                continue
+
+            # ── 关键词过滤 ───────────────────────────
+            score = _relevance_score(post, keywords)
+            if keywords and score == 0:
+                logger.debug(f"  跳过（AI 相关度为0）: {post['title'][:50]}")
+                continue
+
+            post["_relevance"] = score
+            selected.append(post)
+            selected_authors.add(author)
+            logger.info(f"  ✅ 选中 [{len(selected)}/{limit}] "
+                        f"(作者: u/{author}): {post['title'][:55]}")
+            time.sleep(0.1)
+
+        if len(selected) >= limit:
+            break
+
+        if not after_cursor:
+            logger.info("已到达最后一页，无更多帖子")
+            break
+
+        logger.info(f"当前已选 {len(selected)} 条，不足 {limit} 条，继续翻页...")
+        time.sleep(delay)
+
+    if not selected:
+        logger.error("未抓取到任何新帖子，请检查网络或扩大时间范围")
         return []
 
-    logger.info(f"API 返回 {len(children)} 条原始数据，开始过滤和解析...")
+    logger.info(f"\n共选出 {len(selected)} 条帖子（来自 {len(selected_authors)} 位不同作者）")
 
-    # ── 2. 解析并过滤 ─────────────────────────────────
-    all_posts = []
-    for child in children:
-        data = child.get("data", {})
-        post = _extract_post(data, session, delay)
-        if post:
-            post["_relevance"] = _relevance_score(post, keywords)
-            all_posts.append(post)
-        time.sleep(0.1)  # 轻微间隔
-
-    # 按相关度排序（keyword 匹配数降序），过滤掉完全不相关的
-    if keywords:
-        relevant = [p for p in all_posts if p["_relevance"] > 0]
-        if not relevant:
-            logger.warning("无 AI 相关帖子，使用全部帖子")
-            relevant = all_posts
-        relevant.sort(key=lambda p: p["_relevance"], reverse=True)
-        logger.info(f"AI 相关帖子: {len(relevant)}/{len(all_posts)} 条")
-    else:
-        relevant = all_posts
-
-    selected = relevant[:limit]
-
-    # ── 3. 下载图片 ───────────────────────────────────
-    logger.info(f"开始下载 {len(selected)} 条帖子的配图...")
+    # ── 下载图片 ──────────────────────────────────────
+    logger.info(f"开始下载配图...")
     for i, post in enumerate(selected, 1):
         logger.info(f"\n── 帖子 {i}/{len(selected)}: {post['title'][:60]}")
         if not post["image_urls"]:
@@ -414,7 +495,12 @@ def scrape(config: dict = None) -> List[Dict[str, Any]]:
                     "local_path": local_path,
                 })
 
-    # ── 4. 清理临时字段并返回 ─────────────────────────
+    # ── 保存历史记录 ──────────────────────────────────
+    new_ids = {p["id"] for p in selected}
+    seen_ids.update(new_ids)
+    _save_seen_ids(base_dir, seen_ids)
+
+    # ── 清理临时字段并返回 ────────────────────────────
     for post in selected:
         post.pop("_relevance", None)
 

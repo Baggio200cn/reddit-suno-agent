@@ -442,15 +442,13 @@ class RedditAgentApp:
                 raise ImportError("找不到 reddit_scraper.py，请确保与本文件在同一目录")
 
             date_str = datetime.now().strftime("%Y-%m-%d")
-            out_dir = Path(self.cfg["output_dir"]) / date_str / "images"
-            out_dir.mkdir(parents=True, exist_ok=True)
 
             scrape_cfg = {
                 "subreddit":    self.cfg["subreddit"],
                 "limit":        self.cfg["limit"],
                 "mode":         self.cfg["mode"],
                 "proxy":        self.cfg.get("proxy", ""),
-                "output_dir":   str(out_dir),
+                "output_dir":   self.cfg["output_dir"],  # 传基础目录，scraper 自动加日期/images
                 "request_delay": 1.5,
                 "ai_keywords":  self.cfg.get("ai_keywords", []),
             }
