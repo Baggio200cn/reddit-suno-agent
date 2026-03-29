@@ -73,8 +73,8 @@ DEFAULT_CONFIG = {
     "proxy":              "",
     "run_time":           "08:00",
     "output_dir":         str(Path.home() / "Desktop" / "Reddit_AI_资讯"),
-    "doubao_api_key":     "",   # 豆包推理接入点 ID，如 ep-20250101-xxxxxxxx（留空跳过图片分析）
-    "doubao_vision_model": "doubao-vision-pro-32k-241265",
+    "claude_api_key":     "",   # Claude API Key（留空跳过图片分析）
+    "claude_vision_model": "claude-haiku-4-5-20251001",
     "ai_keywords": [
         "llm", "large language model", "agent", "machine learning",
         "claude", "openai", "codex", "deepseek", "kimi", "veo", "gemini",
@@ -398,12 +398,12 @@ class RedditAgentApp:
                  insertbackground=COLORS["text"], relief="flat",
                  font=("Segoe UI", 10)).pack(side="left", padx=(0, 12))
 
-        # 第二行：豆包 API Key
+        # 第二行：Claude API Key
         row2 = tk.Frame(f, bg=COLORS["bg"])
         row2.pack(fill="x", padx=8, pady=(0, 4))
-        self._label(row2, "豆包 API Key（留空跳过图片分析）：", bg=COLORS["bg"]).pack(side="left")
-        self._doubao_key_var = tk.StringVar(value=self.cfg.get("doubao_api_key", ""))
-        tk.Entry(row2, textvariable=self._doubao_key_var, width=36,
+        self._label(row2, "Claude API Key（留空跳过图片分析）：", bg=COLORS["bg"]).pack(side="left")
+        self._claude_key_var = tk.StringVar(value=self.cfg.get("claude_api_key", ""))
+        tk.Entry(row2, textvariable=self._claude_key_var, width=36,
                  bg=COLORS["panel"], fg=COLORS["text_hi"],
                  insertbackground=COLORS["text"], relief="flat",
                  font=("Segoe UI", 10), show="*").pack(side="left", padx=(0, 12))
@@ -471,8 +471,8 @@ class RedditAgentApp:
                 "output_dir":          self.cfg["output_dir"],
                 "request_delay":       1.5,
                 "ai_keywords":         self.cfg.get("ai_keywords", []),
-                "doubao_api_key":      self.cfg.get("doubao_api_key", ""),
-                "doubao_vision_model": self.cfg.get("doubao_vision_model", "doubao-vision-pro-32k-241265"),
+                "claude_api_key":      self.cfg.get("claude_api_key", ""),
+                "claude_vision_model": self.cfg.get("claude_vision_model", "claude-haiku-4-5-20251001"),
             }
 
             # 重定向 logging 到 GUI 日志
@@ -573,10 +573,10 @@ class RedditAgentApp:
     def _save_settings(self):
         self.cfg["run_time"]        = self._time_var.get().strip() or "08:00"
         self.cfg["proxy"]           = self._proxy_var.get().strip()
-        self.cfg["doubao_api_key"]  = self._doubao_key_var.get().strip()
+        self.cfg["claude_api_key"]  = self._claude_key_var.get().strip()
         save_config(self.cfg)
         self._restart_scheduler()
-        has_key = bool(self.cfg.get("doubao_api_key"))
+        has_key = bool(self.cfg.get("claude_api_key"))
         self._log(f"✅ 设置已保存（每天 {self.cfg['run_time']} 运行，"
                   f"图片分析：{'开启' if has_key else '关闭（未填API Key）'}）", "ok")
 

@@ -365,37 +365,41 @@ def _get_post_type(data: dict) -> str:
 #  图片分析 & 视频信息提取
 # ═══════════════════════════════════════════════════════════════════
 
-_DOUBAO_API_URL   = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
-_VISION_MODEL_DEF = "doubao-vision-pro-32k-241265"
-_VISION_PROMPT    = (
-    "请详细描述这张图片的内容，用中文回答。"
-    "重点说明图片中展示的核心概念、技术要点、图表数据或视觉信息，150字以内。"
-)
+_CLAUDE_API_URL   = "https://api.anthropic.com/v1/messages"
+_CLAUDE_MODEL_DEF = "claude-haiku-4-5-20251001"   # 快速便宜，支持视觉
+_VISION_MODEL_DEF = _CLAUDE_MODEL_DEF             # 兼容旧引用
 
 
 def _analyze_image(session: requests.Session, image_url: str,
-                   api_key: str, model: str = _VISION_MODEL_DEF) -> Optional[str]:
-    """调用豆包视觉 API 描述图片，返回中文描述，失败返回 None。"""
+                   api_key: str, model: str = _CLAUDE_MODEL_DEF) -> Optional[str]:
+    """调用 Claude API 描述图片内容，返回中文描述，失败返回 None。"""
     payload = {
         "model": model,
+        "max_tokens": 400,
         "messages": [{
             "role": "user",
             "content": [
-                {"type": "image_url", "image_url": {"url": image_url}},
-                {"type": "text", "text": _VISION_PROMPT},
+                {
+                    "type": "image",
+                    "source": {"type": "url", "url": image_url},
+                },
+                {
+                    "type": "text",
+                    "text": _VISION_PROMPT,
+                },
             ],
         }],
-        "max_tokens": 400,
     }
     headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
     }
     try:
-        resp = requests.post(_DOUBAO_API_URL, headers=headers,
+        resp = requests.post(_CLAUDE_API_URL, headers=headers,
                              json=payload, timeout=60)
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        return resp.json()["content"][0]["text"].strip()
     except Exception as e:
         logger.warning(f"  [视觉API] 分析失败，跳过: {e}")
         return None
@@ -430,15 +434,15 @@ def _enrich_selftext(post: dict, cfg: dict,
                      session: requests.Session, delay: float) -> None:
     """
     分析帖子的图片和视频，将结论追加到 post["selftext"]。
-    - 图片：调用豆包视觉 API（需 doubao_api_key）
+    - 图片：调用 Claude API（需 claude_api_key）
     - YouTube视频：调用 oEmbed API（免费，无需Key）
     修改 post 对象（原地修改），无返回值。
     """
     extra_parts: List[str] = []
 
     # ── 图片分析 ──────────────────────────────────────
-    api_key = cfg.get("doubao_api_key", "").strip()
-    model   = cfg.get("doubao_vision_model", _VISION_MODEL_DEF).strip() or _VISION_MODEL_DEF
+    api_key = cfg.get("claude_api_key", "").strip()
+    model   = cfg.get("claude_vision_model", _CLAUDE_MODEL_DEF).strip() or _CLAUDE_MODEL_DEF
 
     if api_key and post.get("image_urls"):
         descriptions = []
