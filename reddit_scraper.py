@@ -114,20 +114,46 @@ def _fetch_listing(session: requests.Session, endpoint: str,
 
 def _fetch_single_post(session: requests.Session, post_id: str) -> Optional[dict]:
     """
-    请求单条帖子的完整 JSON（含 media_metadata）。
+    请求单条帖子的完整 JSON（含 media_metadata 和评论）。
     Reddit 的列表接口(hot.json)不包含 media_metadata，
     必须通过此接口单独获取 Gallery 图片。
+    返回 (post_data, comments_list)
     """
     url = f"{_BASE_URL}/comments/{post_id}.json"
     try:
-        resp = session.get(url, params={"limit": 1}, timeout=20)
+        resp = session.get(url, params={"limit": 10, "depth": 1}, timeout=20)
         resp.raise_for_status()
         data = resp.json()
         # 响应结构: [帖子列表, 评论列表]
-        return data[0]["data"]["children"][0]["data"]
+        post_data = data[0]["data"]["children"][0]["data"]
+        comments_raw = data[1]["data"]["children"] if len(data) > 1 else []
+        return post_data, comments_raw
     except Exception as e:
         logger.debug(f"获取单帖失败 (id={post_id}): {e}")
-        return None
+        return None, []
+
+
+def _extract_top_comments(comments_raw: list, max_comments: int = 3) -> List[str]:
+    """从评论列表中提取热门评论文本（按点赞数排序，过滤掉机器人/删除评论）。"""
+    comments = []
+    for child in comments_raw:
+        if child.get("kind") != "t1":
+            continue
+        d = child.get("data", {})
+        body = d.get("body", "").strip()
+        score = d.get("score", 0)
+        author = d.get("author", "")
+        # 跳过已删除、机器人、太短的评论
+        if not body or body in ("[deleted]", "[removed]"):
+            continue
+        if author in ("AutoModerator", "reddit-bot"):
+            continue
+        if len(body) < 20:
+            continue
+        comments.append((score, html.unescape(body)))
+    # 按点赞数降序，取前 max_comments 条
+    comments.sort(key=lambda x: x[0], reverse=True)
+    return [text for _, text in comments[:max_comments]]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -168,7 +194,7 @@ def _extract_image_urls(data: dict, session: requests.Session,
             if post_id:
                 logger.info(f"  [图片] Gallery 帖，正在获取完整数据 (id={post_id})...")
                 time.sleep(delay)  # 避免限流
-                full_data = _fetch_single_post(session, post_id)
+                full_data, _ = _fetch_single_post(session, post_id)
                 if full_data:
                     media_metadata = full_data.get("media_metadata")
                     # 同时更新 gallery_data
@@ -291,10 +317,22 @@ def _extract_post(data: dict, session: requests.Session,
 
         image_urls = _extract_image_urls(data, session, delay)
 
+        # 对无正文的链接/图片帖，抓取热门评论补充内容
+        comments: List[str] = []
+        post_id = data.get("id", "")
+        if not selftext and post_id and data.get("num_comments", 0) > 0:
+            logger.info(f"  [评论] 正文为空，抓取热门评论补充内容...")
+            time.sleep(delay)
+            _, comments_raw = _fetch_single_post(session, post_id)
+            comments = _extract_top_comments(comments_raw, max_comments=3)
+            if comments:
+                logger.info(f"  [评论] 获取到 {len(comments)} 条热门评论")
+
         return {
-            "id": data.get("id", ""),
+            "id": post_id,
             "title": html.unescape(data.get("title", "")),
             "selftext": selftext,
+            "comments": comments,          # 无正文时的补充内容
             "url": data.get("url", ""),
             "score": data.get("score", 0),
             "upvote_ratio": data.get("upvote_ratio", 0.0),

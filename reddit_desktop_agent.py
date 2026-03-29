@@ -543,7 +543,11 @@ class RedditAgentApp:
             sub_tag = f"[r/{p.get('subreddit', '?')}] " if p.get("subreddit") else ""
             lines.append(f"【帖子 {i}】{sub_tag}{p['title']}\n")
             if p.get("selftext"):
-                lines.append(f"内容：{p['selftext'][:300]}\n")
+                lines.append(f"内容：{p['selftext'][:500]}\n")
+            elif p.get("comments"):
+                lines.append("内容（热门评论）：\n")
+                for j, c in enumerate(p["comments"], 1):
+                    lines.append(f"  评论{j}：{c[:300]}\n")
             lines.append(f"链接：{p['url']}\n")
             for img in p.get("local_images", []):
                 lines.append(f"图片：{img['local_path']}\n")
