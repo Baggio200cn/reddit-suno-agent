@@ -362,6 +362,116 @@ def _get_post_type(data: dict) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  图片分析 & 视频信息提取
+# ═══════════════════════════════════════════════════════════════════
+
+_DOUBAO_API_URL   = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+_VISION_MODEL_DEF = "doubao-vision-pro-32k-241265"
+_VISION_PROMPT    = (
+    "请详细描述这张图片的内容，用中文回答。"
+    "重点说明图片中展示的核心概念、技术要点、图表数据或视觉信息，150字以内。"
+)
+
+
+def _analyze_image(session: requests.Session, image_url: str,
+                   api_key: str, model: str = _VISION_MODEL_DEF) -> Optional[str]:
+    """调用豆包视觉 API 描述图片，返回中文描述，失败返回 None。"""
+    payload = {
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": image_url}},
+                {"type": "text", "text": _VISION_PROMPT},
+            ],
+        }],
+        "max_tokens": 400,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = requests.post(_DOUBAO_API_URL, headers=headers,
+                             json=payload, timeout=60)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logger.warning(f"  [视觉API] 分析失败，跳过: {e}")
+        return None
+
+
+def _is_youtube_url(url: str) -> bool:
+    """判断 URL 是否为 YouTube 视频链接。"""
+    return bool(url and ("youtube.com/watch" in url or "youtu.be/" in url))
+
+
+def _get_youtube_info(session: requests.Session, url: str) -> Optional[dict]:
+    """
+    通过 YouTube oEmbed API 获取视频基本信息（无需 API Key）。
+    返回 {"title": ..., "author_name": ..., "thumbnail_url": ...}
+    """
+    try:
+        oembed_url = "https://www.youtube.com/oembed"
+        resp = session.get(oembed_url, params={"url": url, "format": "json"}, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        return {
+            "title":         data.get("title", ""),
+            "author_name":   data.get("author_name", ""),
+            "thumbnail_url": data.get("thumbnail_url", ""),
+        }
+    except Exception as e:
+        logger.debug(f"  [YouTube] oEmbed 获取失败: {e}")
+        return None
+
+
+def _enrich_selftext(post: dict, cfg: dict,
+                     session: requests.Session, delay: float) -> None:
+    """
+    分析帖子的图片和视频，将结论追加到 post["selftext"]。
+    - 图片：调用豆包视觉 API（需 doubao_api_key）
+    - YouTube视频：调用 oEmbed API（免费，无需Key）
+    修改 post 对象（原地修改），无返回值。
+    """
+    extra_parts: List[str] = []
+
+    # ── 图片分析 ──────────────────────────────────────
+    api_key = cfg.get("doubao_api_key", "").strip()
+    model   = cfg.get("doubao_vision_model", _VISION_MODEL_DEF).strip() or _VISION_MODEL_DEF
+
+    if api_key and post.get("image_urls"):
+        descriptions = []
+        for i, img_url in enumerate(post["image_urls"], 1):
+            if i > 1:
+                time.sleep(delay)
+            logger.info(f"  [视觉API] 分析图{i}: {img_url[:60]}...")
+            desc = _analyze_image(session, img_url, api_key, model)
+            if desc:
+                descriptions.append(f"图{i}：{desc}")
+        if descriptions:
+            extra_parts.append("【图片分析】\n" + "\n".join(descriptions))
+
+    # ── YouTube 视频信息 ──────────────────────────────
+    if _is_youtube_url(post.get("url", "")):
+        logger.info(f"  [YouTube] 获取视频信息...")
+        info = _get_youtube_info(session, post["url"])
+        if info:
+            lines = ["【视频信息】"]
+            if info["author_name"]:
+                lines.append(f"频道：{info['author_name']}")
+            if info["title"]:
+                lines.append(f"标题：{info['title']}")
+            extra_parts.append("\n".join(lines))
+
+    # ── 追加到 selftext ───────────────────────────────
+    if extra_parts:
+        sep = "\n\n" if post.get("selftext") else ""
+        post["selftext"] = (post.get("selftext") or "") + sep + "\n\n".join(extra_parts)
+        logger.info(f"  [内容增强] 已追加: {', '.join(p.split(chr(10))[0] for p in extra_parts)}")
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  关键词过滤
 # ═══════════════════════════════════════════════════════════════════
 
@@ -414,7 +524,8 @@ def _save_seen_ids(base_dir: str, seen: set):
 
 def _scrape_subreddit(session: requests.Session, subreddit: str, mode: str,
                       quota: int, seen_ids: set, selected_authors: set,
-                      keywords: List[str], delay: float) -> List[Dict[str, Any]]:
+                      keywords: List[str], delay: float,
+                      cfg: dict = None) -> List[Dict[str, Any]]:
     """
     从单个 subreddit 抓取最多 quota 条新帖（跳过已见过的ID和已选过的作者）。
     """
@@ -462,6 +573,11 @@ def _scrape_subreddit(session: requests.Session, subreddit: str, mode: str,
 
             post["_relevance"] = score
             post["subreddit"] = subreddit  # 记录来源社区
+
+            # ── 图片分析 + 视频信息（丰富 selftext）────
+            if cfg:
+                _enrich_selftext(post, cfg, session, delay)
+
             picked.append(post)
             selected_authors.add(author)
             logger.info(f"  ✅ r/{subreddit} → {post['title'][:55]}")
@@ -533,7 +649,8 @@ def scrape(config: dict = None) -> List[Dict[str, Any]]:
         logger.info(f"\n══ 正在抓取 r/{sub}（目标 {quota} 条）...")
         posts = _scrape_subreddit(
             session, sub, mode, quota,
-            seen_ids, selected_authors, keywords, delay
+            seen_ids, selected_authors, keywords, delay,
+            cfg=cfg
         )
         if posts:
             selected.extend(posts)
