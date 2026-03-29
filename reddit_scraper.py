@@ -29,10 +29,18 @@ import requests
 #  ★ 用户配置区（改这里）
 # ─────────────────────────────────────────────
 CONFIG = {
-    # Reddit 目标版块（不含 r/）
-    "subreddit": "ThinkingDeeplyAI",
+    # 多社区抓取（每天从不同社区各取1条，提高内容多样性）
+    "subreddits": [
+        "ThinkingDeeplyAI",
+        "AgentsOfAI",
+        "aiArt",
+        "aivideo",
+        "ClaudeCode",
+        "Teachers",
+        "books",
+    ],
 
-    # 获取帖子数量
+    # 获取帖子总数量（会均分到各社区）
     "limit": 5,
 
     # 抓取模式："hot"=热门(置顶帖靠前) / "top"=今日最热
@@ -55,6 +63,7 @@ CONFIG = {
         "gpt", "diffusion", "transformer", "neural", "algorithm",
         "fine-tuning", "rag", "multimodal", "reasoning", "inference",
         "model", "ai", "artificial intelligence",
+        "art", "teacher", "book", "education", "creative",
     ],
 }
 # ─────────────────────────────────────────────
@@ -365,9 +374,73 @@ def _save_seen_ids(base_dir: str, seen: set):
 #  主函数
 # ═══════════════════════════════════════════════════════════════════
 
+def _scrape_subreddit(session: requests.Session, subreddit: str, mode: str,
+                      quota: int, seen_ids: set, selected_authors: set,
+                      keywords: List[str], delay: float) -> List[Dict[str, Any]]:
+    """
+    从单个 subreddit 抓取最多 quota 条新帖（跳过已见过的ID和已选过的作者）。
+    """
+    if mode == "top":
+        endpoint = f"/r/{subreddit}/top.json"
+        base_params = {"limit": 25, "t": "week"}
+    else:
+        endpoint = f"/r/{subreddit}/hot.json"
+        base_params = {"limit": 25}
+
+    picked: List[Dict[str, Any]] = []
+    after_cursor = None
+    max_pages = 3  # 每个社区最多翻3页
+
+    for page in range(max_pages):
+        params = dict(base_params)
+        if after_cursor:
+            params["after"] = after_cursor
+
+        logger.info(f"  [{subreddit}] 第{page+1}页...")
+        children, after_cursor = _fetch_listing(session, endpoint, params)
+
+        if not children:
+            break
+
+        for child in children:
+            if len(picked) >= quota:
+                break
+            data = child.get("data", {})
+            post_id = data.get("id", "")
+            author  = data.get("author", "")
+
+            if post_id in seen_ids:
+                continue
+            if author and author in selected_authors:
+                continue
+
+            post = _extract_post(data, session, delay)
+            if not post:
+                continue
+
+            score = _relevance_score(post, keywords)
+            if keywords and score == 0:
+                continue
+
+            post["_relevance"] = score
+            post["subreddit"] = subreddit  # 记录来源社区
+            picked.append(post)
+            selected_authors.add(author)
+            logger.info(f"  ✅ r/{subreddit} → {post['title'][:55]}")
+            time.sleep(0.1)
+
+        if len(picked) >= quota:
+            break
+        if not after_cursor:
+            break
+        time.sleep(delay)
+
+    return picked
+
+
 def scrape(config: dict = None) -> List[Dict[str, Any]]:
     """
-    主入口：抓取帖子 + 下载图片，返回帖子列表。
+    主入口：从多个 subreddit 抓取帖子 + 下载图片，返回帖子列表。
 
     Args:
         config: 配置字典（不传则使用文件顶部的 CONFIG）
@@ -376,7 +449,8 @@ def scrape(config: dict = None) -> List[Dict[str, Any]]:
         帖子列表（包含 local_images 本地路径列表）
     """
     cfg = config or CONFIG
-    subreddit   = cfg["subreddit"]
+    # 支持新的 subreddits 列表，兼容旧的 subreddit 单值
+    subreddits = cfg.get("subreddits") or [cfg.get("subreddit", "ThinkingDeeplyAI")]
     limit       = cfg["limit"]
     mode        = cfg["mode"]
     proxy       = cfg.get("proxy", "")
@@ -386,7 +460,7 @@ def scrape(config: dict = None) -> List[Dict[str, Any]]:
     # 输出目录：按日期子目录
     date_str = datetime.now().strftime("%Y-%m-%d")
     if cfg.get("output_dir"):
-        base_dir   = cfg["output_dir"]          # 例：Desktop/Reddit_AI_资讯
+        base_dir   = cfg["output_dir"]
         output_dir = os.path.join(base_dir, date_str, "images")
     else:
         base_dir   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
@@ -396,91 +470,48 @@ def scrape(config: dict = None) -> List[Dict[str, Any]]:
 
     # ── 加载历史记录（去重用）────────────────────────
     seen_ids = _load_seen_ids(base_dir)
-    logger.info(f"历史记录中已有 {len(seen_ids)} 条帖子 ID，将跳过重复内容")
+    logger.info(f"历史记录: {len(seen_ids)} 条已见过的帖子 ID")
 
     session = _make_session(proxy)
 
-    # ── 分页抓取，直到凑足 limit 条新帖 ──────────────
-    if mode == "top":
-        endpoint = f"/r/{subreddit}/top.json"
-        base_params = {"limit": 25, "t": "week"}
-    else:
-        endpoint = f"/r/{subreddit}/hot.json"
-        base_params = {"limit": 25}
+    # ── 计算每个社区的配额 ────────────────────────────
+    # 例：5条帖子 / 7个社区 → 前5个社区各取1条
+    n_subs = len(subreddits)
+    base_quota = limit // n_subs          # 每个社区基础配额
+    extra      = limit % n_subs           # 余数分给前 extra 个社区
+    quotas = [base_quota + (1 if i < extra else 0) for i in range(n_subs)]
+    # 过滤配额为0的社区（当社区数 > limit 时）
+    active = [(sub, q) for sub, q in zip(subreddits, quotas) if q > 0]
 
+    logger.info(f"本次抓取计划: {len(active)} 个社区，总目标 {limit} 条")
+    for sub, q in active:
+        logger.info(f"  r/{sub} → {q} 条")
+
+    # ── 逐社区抓取 ────────────────────────────────────
     selected: List[Dict[str, Any]] = []
     selected_authors: set = set()
-    after_cursor = None
-    max_pages = 5  # 最多翻5页，防止无限循环
 
-    for page in range(max_pages):
-        params = dict(base_params)
-        if after_cursor:
-            params["after"] = after_cursor
-
-        logger.info(f"正在抓取第 {page + 1} 页（r/{subreddit} · {mode}）...")
-        children, after_cursor = _fetch_listing(session, endpoint, params)
-
-        if not children:
-            logger.warning("本页无数据，停止翻页")
-            break
-
-        logger.info(f"第 {page + 1} 页返回 {len(children)} 条，开始过滤...")
-
-        for child in children:
-            if len(selected) >= limit:
-                break
-            data = child.get("data", {})
-            post_id = data.get("id", "")
-            author  = data.get("author", "")
-
-            # ── 跳过已抓取过的帖子 ──────────────────
-            if post_id in seen_ids:
-                logger.debug(f"  跳过（已见过）: {post_id}")
-                time.sleep(0.05)
-                continue
-
-            # ── 跳过同作者帖子 ───────────────────────
-            if author and author in selected_authors:
-                logger.debug(f"  跳过（作者重复 u/{author}）")
-                time.sleep(0.05)
-                continue
-
-            post = _extract_post(data, session, delay)
-            if not post:
-                continue
-
-            # ── 关键词过滤 ───────────────────────────
-            score = _relevance_score(post, keywords)
-            if keywords and score == 0:
-                logger.debug(f"  跳过（AI 相关度为0）: {post['title'][:50]}")
-                continue
-
-            post["_relevance"] = score
-            selected.append(post)
-            selected_authors.add(author)
-            logger.info(f"  ✅ 选中 [{len(selected)}/{limit}] "
-                        f"(作者: u/{author}): {post['title'][:55]}")
-            time.sleep(0.1)
-
-        if len(selected) >= limit:
-            break
-
-        if not after_cursor:
-            logger.info("已到达最后一页，无更多帖子")
-            break
-
-        logger.info(f"当前已选 {len(selected)} 条，不足 {limit} 条，继续翻页...")
+    for sub, quota in active:
+        logger.info(f"\n══ 正在抓取 r/{sub}（目标 {quota} 条）...")
+        posts = _scrape_subreddit(
+            session, sub, mode, quota,
+            seen_ids, selected_authors, keywords, delay
+        )
+        if posts:
+            selected.extend(posts)
+            logger.info(f"  r/{sub} 贡献 {len(posts)} 条")
+        else:
+            logger.warning(f"  r/{sub} 无新帖，跳过")
         time.sleep(delay)
 
     if not selected:
-        logger.error("未抓取到任何新帖子，请检查网络或扩大时间范围")
+        logger.error("所有社区均无新帖子，请检查网络或减少历史记录")
         return []
 
-    logger.info(f"\n共选出 {len(selected)} 条帖子（来自 {len(selected_authors)} 位不同作者）")
+    logger.info(f"\n共选出 {len(selected)} 条帖子（来自 {len(set(p['subreddit'] for p in selected))} 个社区）")
 
     # ── 下载图片 ──────────────────────────────────────
-    logger.info(f"开始下载配图...")
+    logger.info("开始下载配图...")
     for i, post in enumerate(selected, 1):
         logger.info(f"\n── 帖子 {i}/{len(selected)}: {post['title'][:60]}")
         if not post["image_urls"]:
@@ -490,14 +521,10 @@ def scrape(config: dict = None) -> List[Dict[str, Any]]:
             time.sleep(delay)
             local_path = _download_image(session, url, output_dir, i, j)
             if local_path:
-                post["local_images"].append({
-                    "url": url,
-                    "local_path": local_path,
-                })
+                post["local_images"].append({"url": url, "local_path": local_path})
 
     # ── 保存历史记录 ──────────────────────────────────
-    new_ids = {p["id"] for p in selected}
-    seen_ids.update(new_ids)
+    seen_ids.update(p["id"] for p in selected)
     _save_seen_ids(base_dir, seen_ids)
 
     # ── 清理临时字段并返回 ────────────────────────────

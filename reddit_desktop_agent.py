@@ -59,7 +59,15 @@ _DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_FILE = _DIR / "agent_config.json"
 
 DEFAULT_CONFIG = {
-    "subreddit":     "ThinkingDeeplyAI",
+    "subreddits": [
+        "ThinkingDeeplyAI",
+        "AgentsOfAI",
+        "aiArt",
+        "aivideo",
+        "ClaudeCode",
+        "Teachers",
+        "books",
+    ],
     "limit":         5,
     "mode":          "hot",
     "proxy":         "",
@@ -71,6 +79,7 @@ DEFAULT_CONFIG = {
         "gpt", "diffusion", "transformer", "neural", "algorithm",
         "fine-tuning", "rag", "multimodal", "reasoning", "inference",
         "model", "ai", "artificial intelligence",
+        "art", "teacher", "book", "education", "creative",
     ],
 }
 
@@ -444,11 +453,11 @@ class RedditAgentApp:
             date_str = datetime.now().strftime("%Y-%m-%d")
 
             scrape_cfg = {
-                "subreddit":    self.cfg["subreddit"],
+                "subreddits":   self.cfg.get("subreddits") or [self.cfg.get("subreddit", "ThinkingDeeplyAI")],
                 "limit":        self.cfg["limit"],
                 "mode":         self.cfg["mode"],
                 "proxy":        self.cfg.get("proxy", ""),
-                "output_dir":   self.cfg["output_dir"],  # 传基础目录，scraper 自动加日期/images
+                "output_dir":   self.cfg["output_dir"],
                 "request_delay": 1.5,
                 "ai_keywords":  self.cfg.get("ai_keywords", []),
             }
@@ -527,10 +536,12 @@ class RedditAgentApp:
             messagebox.showinfo("提示", "还没有抓取结果，请先点「立即运行」")
             return
         date_str = datetime.now().strftime("%Y-%m-%d")
+        subs = self.cfg.get("subreddits") or [self.cfg.get("subreddit", "ThinkingDeeplyAI")]
         lines = [f"=== Reddit AI 资讯  {date_str} ===\n",
-                 f"来源: r/{self.cfg['subreddit']}\n\n"]
+                 f"来源社区: {', '.join('r/'+s for s in subs)}\n\n"]
         for i, p in enumerate(self.posts, 1):
-            lines.append(f"【帖子 {i}】{p['title']}\n")
+            sub_tag = f"[r/{p.get('subreddit', '?')}] " if p.get("subreddit") else ""
+            lines.append(f"【帖子 {i}】{sub_tag}{p['title']}\n")
             if p.get("selftext"):
                 lines.append(f"内容：{p['selftext'][:300]}\n")
             lines.append(f"链接：{p['url']}\n")
