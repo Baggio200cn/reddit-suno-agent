@@ -368,6 +368,10 @@ def _get_post_type(data: dict) -> str:
 _CLAUDE_API_URL   = "https://api.anthropic.com/v1/messages"
 _CLAUDE_MODEL_DEF = "claude-haiku-4-5-20251001"   # 快速便宜，支持视觉
 _VISION_MODEL_DEF = _CLAUDE_MODEL_DEF             # 兼容旧引用
+_VISION_PROMPT    = (
+    "请详细描述这张图片的内容，用中文回答。"
+    "重点说明核心概念、技术要点、图表数据或视觉信息，150字以内。"
+)
 
 
 def _analyze_image(session: requests.Session, image_url: str,
