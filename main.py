@@ -22,6 +22,9 @@ from src.processors.image_processor import ImageProcessor
 from src.publishers.github_publisher import GitHubPublisher
 from src.publishers.email_notifier import EmailNotifier
 
+# 确保日志目录存在
+os.makedirs('logs', exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
