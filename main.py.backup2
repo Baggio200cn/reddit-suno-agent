@@ -1,0 +1,252 @@
+"""
+主程序 - Reddit 素材分析 + 光学/机器视觉新闻爬取（双轨并行）
+
+功能：
+1. Reddit 轨道：接收用户提供的 JSON + PNG，生成 AI 科技前沿日记 + 歌曲
+2. 光学轨道：爬取光学/机器视觉新闻，生成 5 条新闻事实调查 + 歌曲
+
+核心原则：
+- 忠实于原文，不添加创意和泛化说明
+- 尊重科学性和原创性
+"""
+import sys
+import os
+import json
+import logging
+from datetime import datetime
+from typing import Dict, List, Optional
+
+# 添加项目根目录到路径
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from src.collectors.reddit_input_handler import RedditInputHandler
+from src.collectors.optics_news_collector import OpticsNewsCollector
+from src.generators.lyrics_generator import LyricsGenerator
+from src.generators.music_generator import MusicGenerator
+from src.generators.article_generator import ArticleGenerator
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('logs/app.log', encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+class DualTrackAgent:
+    """双轨智能体 - Reddit + 光学/机器视觉"""
+
+    def __init__(self):
+        """初始化双轨智能体"""
+        self.today = datetime.now().strftime("%Y-%m-%d")
+
+        # 输入/输出目录
+        self.reddit_input_dir = "input/reddit"
+        self.reddit_output_dir = f"output/reddit/{self.today}"
+        self.optics_output_dir = f"output/optics/{self.today}"
+
+        # 创建输出目录
+        os.makedirs(self.reddit_output_dir, exist_ok=True)
+        os.makedirs(self.optics_output_dir, exist_ok=True)
+        os.makedirs("logs", exist_ok=True)
+
+        # 初始化组件
+        self.reddit_handler = RedditInputHandler()
+        self.optics_collector = OpticsNewsCollector()
+        self.lyrics_generator = LyricsGenerator()
+
+        logger.info("=" * 60)
+        logger.info(f"双轨智能体已初始化")
+        logger.info(f"日期: {self.today}")
+        logger.info("=" * 60)
+
+    def run_reddit_track(self) -> bool:
+        """
+        Reddit 轨道：处理用户提供的素材
+
+        Returns:
+            是否成功
+        """
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("【轨道 1/2】Reddit 素材分析")
+        logger.info("=" * 60)
+
+        try:
+            # 1. 查找输入文件
+            json_file = os.path.join(self.reddit_input_dir, f"{self.today}/posts.json")
+            image_dir = os.path.join(self.reddit_input_dir, f"{self.today}/images")
+
+            if not os.path.exists(json_file):
+                logger.warning(f"未找到 Reddit 输入文件: {json_file}")
+                logger.info("请将素材放在 input/reddit/{日期}/ 目录下")
+                return False
+
+            # 2. 加载素材
+            logger.info(f"加载 Reddit 素材: {json_file}")
+            posts = self.reddit_handler.process(json_file, image_dir)
+
+            if not posts:
+                logger.error("未能加载 Reddit 素材")
+                return False
+
+            logger.info(f"成功加载 {len(posts)} 条帖子")
+
+            # 3. 生成文章（AI 科技前沿日记）
+            logger.info("生成 AI 科技前沿日记...")
+            article_path = os.path.join(self.reddit_output_dir, "article.md")
+
+            # 初始化文章生成器
+            article_generator = ArticleGenerator()
+            article_generator.generate(posts, image_dir, article_path)
+
+            # 4. 生成歌词（U2 + 说唱风格）
+            logger.info("生成歌词（U2 + 说唱风格）...")
+            content = " ".join([post['title'] + " " + post['content'] for post in posts])
+            lyrics = self.lyrics_generator.generate(content, style="u2_rap", theme="社区讨论")
+
+            lyrics_path = os.path.join(self.reddit_output_dir, "lyrics.txt")
+            with open(lyrics_path, 'w', encoding='utf-8') as f:
+                f.write(lyrics)
+
+            logger.info(f"歌词已保存至: {lyrics_path}")
+
+            # 5. 生成歌曲（调用 x-mi.cn）
+            logger.info("生成歌曲（x-mi.cn）...")
+            # TODO: 实现音乐生成
+            song_path = os.path.join(self.reddit_output_dir, "song.mp3")
+            logger.info(f"歌曲将保存至: {song_path}")
+
+            logger.info("")
+            logger.info("=" * 60)
+            logger.info("✅ Reddit 轨道完成")
+            logger.info("=" * 60)
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Reddit 轨道失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def run_optics_track(self) -> bool:
+        """
+        光学/机器视觉轨道：爬取新闻
+
+        Returns:
+            是否成功
+        """
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("【轨道 2/2】光学/机器视觉新闻爬取")
+        logger.info("=" * 60)
+
+        try:
+            # 1. 爬取新闻
+            logger.info("爬取光学/机器视觉新闻...")
+            news_list = self.optics_collector.collect_all(total_limit=5)
+
+            if not news_list:
+                logger.error("未能爬取到新闻")
+                return False
+
+            logger.info(f"成功爬取 {len(news_list)} 条新闻")
+
+            # 2. 生成新闻事实调查（Markdown 格式）
+            logger.info("生成新闻事实调查（.md 格式）...")
+            news_path = os.path.join(self.optics_output_dir, "news.md")
+
+            with open(news_path, 'w', encoding='utf-8') as f:
+                f.write(f"# 光学机器视觉前沿 - {self.today}\n\n")
+                f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                f.write("---\n\n")
+
+                for i, news in enumerate(news_list, 1):
+                    f.write(f"## {i}. {news['title']}\n\n")
+                    f.write(f"**来源**: {news['source']}\n\n")
+                    f.write(f"**日期**: {news['date']}\n\n")
+                    f.write(f"**摘要**: {news['summary']}\n\n")
+                    f.write(f"**链接**: {news['url']}\n\n")
+                    f.write(f"**与AI的关系**: 光学和机器视觉技术领域的前沿发展。\n\n")
+                    f.write(f"**重要程度**: ⭐⭐⭐⭐⭐\n\n")
+                    f.write("---\n\n")
+
+            logger.info(f"新闻已保存至: {news_path}")
+
+            # 3. 生成歌词（崔健风格）
+            logger.info("生成歌词（崔健风格）...")
+            content = " ".join([news['title'] + " " + news['summary'] for news in news_list])
+            lyrics = self.lyrics_generator.generate(content, style="cuijian", theme="光学技术")
+
+            lyrics_path = os.path.join(self.optics_output_dir, "lyrics.txt")
+            with open(lyrics_path, 'w', encoding='utf-8') as f:
+                f.write(lyrics)
+
+            logger.info(f"歌词已保存至: {lyrics_path}")
+
+            # 4. 生成歌曲（调用 x-mi.cn）
+            logger.info("生成歌曲（x-mi.cn）...")
+            # TODO: 实现音乐生成
+            song_path = os.path.join(self.optics_output_dir, "song.mp3")
+            logger.info(f"歌曲将保存至: {song_path}")
+
+            logger.info("")
+            logger.info("=" * 60)
+            logger.info("✅ 光学轨道完成")
+            logger.info("=" * 60)
+
+            return True
+
+        except Exception as e:
+            logger.error(f"光学轨道失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def run(self):
+        """运行双轨并行流程"""
+        logger.info("")
+        logger.info("🚀 开始执行双轨并行流程")
+        logger.info("")
+
+        # 轨道 1: Reddit
+        reddit_success = self.run_reddit_track()
+
+        # 轨道 2: 光学/机器视觉
+        optics_success = self.run_optics_track()
+
+        # 总结
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("📊 执行总结")
+        logger.info("=" * 60)
+        logger.info(f"Reddit 轨道: {'✅ 成功' if reddit_success else '❌ 失败'}")
+        logger.info(f"光学轨道: {'✅ 成功' if optics_success else '❌ 失败'}")
+        logger.info("")
+
+        if reddit_success or optics_success:
+            logger.info("📂 输出目录:")
+            if reddit_success:
+                logger.info(f"  Reddit: {self.reddit_output_dir}")
+            if optics_success:
+                logger.info(f"  光学: {self.optics_output_dir}")
+            logger.info("")
+
+        return reddit_success or optics_success
+
+
+if __name__ == "__main__":
+    logger.info("=" * 60)
+    logger.info("Reddit + 光学/机器视觉双轨智能体")
+    logger.info("=" * 60)
+    logger.info("")
+
+    agent = DualTrackAgent()
+    success = agent.run()
+
+    sys.exit(0 if success else 1)
