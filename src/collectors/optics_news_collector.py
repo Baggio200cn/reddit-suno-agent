@@ -21,6 +21,9 @@ class OpticsNewsCollector:
             "arXiv": "https://export.arxiv.org/rss/cs.CV",  # 计算机视觉
             "MIT Tech Review": "https://www.technologyreview.com/feed/",
             "Photonics Media": "https://www.photonics.com/rss",
+            "ScienceDaily": "https://www.sciencedaily.com/rss/computers_math/artificial_intelligence.xml",
+            "TechCrunch AI": "https://techcrunch.com/category/artificial-intelligence/feed/",
+            "The Verge AI": "https://www.theverge.com/ai-artificial-intelligence/rss/index.xml"
         }
 
         # AI 相关关键词
