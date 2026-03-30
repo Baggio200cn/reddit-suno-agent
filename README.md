@@ -244,8 +244,14 @@ python main.py --schedule
 
 ### 🎨 完整案例展示
 
-下载 [demo_final.html](./demo_final.html) (14MB) 查看包含所有资源的完整案例展示：
+> ⚠️ **注意**：由于 demo_final.html 文件较大（14MB），GitHub 无法直接在网页上预览。
 
+**查看方法**：
+1. 点击 [demo_final.html](./demo_final.html) 文件链接
+2. 点击右上角的 **"下载"** 按钮下载到本地
+3. 用浏览器打开下载的文件即可查看完整案例
+
+**案例展示内容**：
 - 📝 5篇 AI 技术文章
 - 🖼️ 5张高清配图（已嵌入）
 - 🎵 完整歌词
