@@ -15,6 +15,7 @@ reddit_scraper.py
 import html
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -67,6 +68,45 @@ CONFIG = {
     ],
 }
 # ─────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════
+#  抓取策略定义
+# ═══════════════════════════════════════════════════════════════════
+
+STRATEGIES: Dict[str, dict] = {
+    "trending": {
+        # 趋势：近48小时高热度新帖（默认推荐）
+        "api_mode": "hot",
+        "weights": {"recency": 0.40, "score": 0.30, "comments": 0.20, "relevance": 0.10},
+        "min_score": 10,
+        "min_upvote_ratio": 0.65,
+        "max_age_hours": 48,
+    },
+    "quality": {
+        # 精品：高赞高讨论、一周内权威帖子
+        "api_mode": "top",
+        "weights": {"score": 0.40, "comments": 0.25, "recency": 0.20, "relevance": 0.15},
+        "min_score": 100,
+        "min_upvote_ratio": 0.80,
+        "max_age_hours": 168,
+    },
+    "fresh": {
+        # 新鲜：24小时内任意有讨论的新帖
+        "api_mode": "new",
+        "weights": {"recency": 0.60, "score": 0.20, "comments": 0.10, "relevance": 0.10},
+        "min_score": 1,
+        "min_upvote_ratio": 0.50,
+        "max_age_hours": 24,
+    },
+    "hot": {
+        # 热门：兼容旧版行为
+        "api_mode": "hot",
+        "weights": {"score": 0.50, "recency": 0.30, "comments": 0.20, "relevance": 0.00},
+        "min_score": 5,
+        "min_upvote_ratio": 0.60,
+        "max_age_hours": 168,
+    },
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -491,6 +531,29 @@ def _relevance_score(post: dict, keywords: List[str]) -> int:
     return sum(1 for kw in keywords if kw in text)
 
 
+def _compute_composite_score(post: dict, weights: dict, now_ts: float) -> float:
+    """
+    计算帖子的复合质量评分（0~1）。
+    - recency：时效分，线性衰减，7天后归零
+    - score：热度分，log归一化（参考上限10000分）
+    - comments：讨论分，log归一化（参考上限1000条）
+    - relevance：相关性分（关键词命中数，上限5个）
+    upvote_ratio 作为乘法系数，降低争议帖排名。
+    """
+    age_hours = (now_ts - float(post.get("created_utc", now_ts))) / 3600
+    recency   = max(0.0, 1.0 - age_hours / 168)
+    score_f   = min(1.0, math.log1p(max(0, post.get("score", 0))) / math.log1p(10000))
+    comment_f = min(1.0, math.log1p(post.get("num_comments", 0)) / math.log1p(1000))
+    relevance_f = min(1.0, post.get("_relevance", 1) / 5)
+    raw = (
+        weights.get("recency",   0) * recency    +
+        weights.get("score",     0) * score_f    +
+        weights.get("comments",  0) * comment_f  +
+        weights.get("relevance", 0) * relevance_f
+    )
+    return raw * max(0.5, post.get("upvote_ratio", 0.7))
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  历史去重
 # ═══════════════════════════════════════════════════════════════════
@@ -530,39 +593,53 @@ def _save_seen_ids(base_dir: str, seen: set):
 #  主函数
 # ═══════════════════════════════════════════════════════════════════
 
-def _scrape_subreddit(session: requests.Session, subreddit: str, mode: str,
+def _scrape_subreddit(session: requests.Session, subreddit: str,
                       quota: int, seen_ids: set, selected_authors: set,
                       keywords: List[str], delay: float,
-                      cfg: dict = None) -> List[Dict[str, Any]]:
+                      strategy: dict, cfg: dict = None) -> List[Dict[str, Any]]:
     """
-    从单个 subreddit 抓取最多 quota 条新帖（跳过已见过的ID和已选过的作者）。
+    从单个 subreddit 抓取候选帖，经多维评分排序后取 quota 条最优帖子。
+
+    策略 strategy 包含：
+      api_mode         - "hot" / "top" / "new"
+      weights          - 各维度权重 dict
+      min_score        - 最低热度门槛
+      min_upvote_ratio - 最低好评率门槛
+      max_age_hours    - 最大帖子年龄（小时）
     """
-    if mode == "top":
-        endpoint = f"/r/{subreddit}/top.json"
+    api_mode = strategy.get("api_mode", "hot")
+    if api_mode == "top":
+        endpoint    = f"/r/{subreddit}/top.json"
         base_params = {"limit": 25, "t": "week"}
+    elif api_mode == "new":
+        endpoint    = f"/r/{subreddit}/new.json"
+        base_params = {"limit": 25}
     else:
-        endpoint = f"/r/{subreddit}/hot.json"
+        endpoint    = f"/r/{subreddit}/hot.json"
         base_params = {"limit": 25}
 
-    picked: List[Dict[str, Any]] = []
-    after_cursor = None
-    max_pages = 3  # 每个社区最多翻3页
+    min_score   = strategy.get("min_score", 1)
+    min_ratio   = strategy.get("min_upvote_ratio", 0.5)
+    max_age_h   = strategy.get("max_age_hours", 168)
+    weights     = strategy.get("weights", {"score": 0.5, "recency": 0.3, "comments": 0.2, "relevance": 0.0})
 
-    for page in range(max_pages):
+    candidates: List[Dict[str, Any]] = []
+    after_cursor = None
+    now_ts = time.time()
+
+    # ── 第一阶段：抓取全部候选帖（最多3页）──────────────
+    for page in range(3):
         params = dict(base_params)
         if after_cursor:
             params["after"] = after_cursor
 
-        logger.info(f"  [{subreddit}] 第{page+1}页...")
+        logger.info(f"  [{subreddit}] 抓取第{page+1}页（{api_mode}）...")
         children, after_cursor = _fetch_listing(session, endpoint, params)
-
         if not children:
             break
 
         for child in children:
-            if len(picked) >= quota:
-                break
-            data = child.get("data", {})
+            data    = child.get("data", {})
             post_id = data.get("id", "")
             author  = data.get("author", "")
 
@@ -575,27 +652,54 @@ def _scrape_subreddit(session: requests.Session, subreddit: str, mode: str,
             if not post:
                 continue
 
-            score = _relevance_score(post, keywords)
-            if keywords and score == 0:
+            # 关键词过滤
+            rel = _relevance_score(post, keywords)
+            if keywords and rel == 0:
                 continue
+            post["_relevance"] = rel
+            post["subreddit"]  = subreddit
 
-            post["_relevance"] = score
-            post["subreddit"] = subreddit  # 记录来源社区
+            candidates.append(post)
 
-            # ── 图片分析 + 视频信息（丰富 selftext）────
-            if cfg:
-                _enrich_selftext(post, cfg, session, delay)
-
-            picked.append(post)
-            selected_authors.add(author)
-            logger.info(f"  ✅ r/{subreddit} → {post['title'][:55]}")
-            time.sleep(0.1)
-
-        if len(picked) >= quota:
-            break
         if not after_cursor:
             break
         time.sleep(delay)
+
+    if not candidates:
+        logger.info(f"  r/{subreddit} 无候选帖")
+        return []
+
+    logger.info(f"  [{subreddit}] 候选帖 {len(candidates)} 条，开始评分筛选...")
+
+    # ── 第二阶段：门槛过滤 + 复合评分 ──────────────────
+    scored: List[Dict[str, Any]] = []
+    for post in candidates:
+        age_h = (now_ts - float(post.get("created_utc", now_ts))) / 3600
+        if post.get("score", 0) < min_score:
+            continue
+        if post.get("upvote_ratio", 1.0) < min_ratio:
+            continue
+        if age_h > max_age_h:
+            continue
+        post["_composite"] = _compute_composite_score(post, weights, now_ts)
+        scored.append(post)
+
+    if not scored:
+        logger.warning(f"  [{subreddit}] 无帖子通过门槛过滤（min_score={min_score}, "
+                       f"min_ratio={min_ratio}, max_age={max_age_h}h）")
+        return []
+
+    # ── 第三阶段：按评分排序，取前 quota 条 ────────────
+    scored.sort(key=lambda p: p["_composite"], reverse=True)
+    picked = scored[:quota]
+
+    for post in picked:
+        selected_authors.add(post.get("author", ""))
+        # 图片分析 + 视频信息（丰富 selftext）
+        if cfg:
+            _enrich_selftext(post, cfg, session, delay)
+        cs = post.get("_composite", 0)
+        logger.info(f"  ✅ r/{subreddit} [评分{cs:.2f}] → {post['title'][:50]}")
 
     return picked
 
@@ -614,10 +718,16 @@ def scrape(config: dict = None) -> List[Dict[str, Any]]:
     # 支持新的 subreddits 列表，兼容旧的 subreddit 单值
     subreddits = cfg.get("subreddits") or [cfg.get("subreddit", "ThinkingDeeplyAI")]
     limit       = cfg["limit"]
-    mode        = cfg["mode"]
     proxy       = cfg.get("proxy", "")
     delay       = cfg.get("request_delay", 1.5)
     keywords    = [k.lower() for k in cfg.get("ai_keywords", [])]
+
+    # 策略选择（默认 trending）
+    strategy_name = cfg.get("strategy", "trending")
+    strategy = STRATEGIES.get(strategy_name, STRATEGIES["trending"])
+    logger.info(f"抓取策略: {strategy_name}（{strategy['api_mode']} | "
+                f"min_score≥{strategy['min_score']} | "
+                f"max_age≤{strategy['max_age_hours']}h）")
 
     # 输出目录：按日期子目录
     date_str = datetime.now().strftime("%Y-%m-%d")
@@ -656,9 +766,9 @@ def scrape(config: dict = None) -> List[Dict[str, Any]]:
     for sub, quota in active:
         logger.info(f"\n══ 正在抓取 r/{sub}（目标 {quota} 条）...")
         posts = _scrape_subreddit(
-            session, sub, mode, quota,
+            session, sub, quota,
             seen_ids, selected_authors, keywords, delay,
-            cfg=cfg
+            strategy=strategy, cfg=cfg
         )
         if posts:
             selected.extend(posts)
@@ -693,6 +803,7 @@ def scrape(config: dict = None) -> List[Dict[str, Any]]:
     # ── 清理临时字段并返回 ────────────────────────────
     for post in selected:
         post.pop("_relevance", None)
+        post.pop("_composite", None)
 
     logger.info(f"\n{'='*50}")
     logger.info(f"✅ 完成！共处理 {len(selected)} 条帖子")
