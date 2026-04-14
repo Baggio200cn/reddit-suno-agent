@@ -68,8 +68,8 @@ DEFAULT_CONFIG = {
         "Teachers",
         "books",
     ],
-    "limit":              5,
-    "mode":               "hot",
+    "limit_min":          5,
+    "limit_max":          8,
     "proxy":              "",
     "run_time":           "08:00",
     "output_dir":         str(Path.home() / "Desktop" / "Reddit_AI_资讯"),
@@ -83,6 +83,11 @@ DEFAULT_CONFIG = {
         "fine-tuning", "rag", "multimodal", "reasoning", "inference",
         "model", "ai", "artificial intelligence",
         "art", "teacher", "book", "education", "creative",
+        # SEO / 外链
+        "seo", "search engine optimization", "backlink", "link building",
+        "external link", "outreach", "anchor text", "domain authority",
+        "guest post", "dofollow", "nofollow", "serp", "organic traffic",
+        "pagerank", "link profile", "off-page", "link juice",
     ],
 }
 
@@ -487,7 +492,8 @@ class RedditAgentApp:
 
             scrape_cfg = {
                 "subreddits":          subs,
-                "limit":               self.cfg["limit"],
+                "limit_min":           self.cfg.get("limit_min", 5),
+                "limit_max":           self.cfg.get("limit_max", 8),
                 "proxy":               self.cfg.get("proxy", ""),
                 "output_dir":          self.cfg["output_dir"],
                 "request_delay":       1.5,

@@ -16,6 +16,7 @@ import html
 import json
 import logging
 import math
+import random
 import os
 import re
 import time
@@ -41,11 +42,9 @@ CONFIG = {
         "books",
     ],
 
-    # 获取帖子总数量（会均分到各社区）
-    "limit": 5,
-
-    # 抓取模式："hot"=热门(置顶帖靠前) / "top"=今日最热
-    "mode": "hot",
+    # 每日抓取数量范围（每次运行随机取范围内的数值）
+    "limit_min": 5,
+    "limit_max": 8,
 
     # 代理（国内用户必须填，留空则直连）
     # 示例："http://127.0.0.1:7890"
@@ -65,6 +64,11 @@ CONFIG = {
         "fine-tuning", "rag", "multimodal", "reasoning", "inference",
         "model", "ai", "artificial intelligence",
         "art", "teacher", "book", "education", "creative",
+        # SEO / 外链
+        "seo", "search engine optimization", "backlink", "link building",
+        "external link", "outreach", "anchor text", "domain authority",
+        "guest post", "dofollow", "nofollow", "serp", "organic traffic",
+        "pagerank", "link profile", "off-page", "link juice",
     ],
 }
 # ─────────────────────────────────────────────
@@ -523,6 +527,16 @@ def _enrich_selftext(post: dict, cfg: dict,
 #  关键词过滤
 # ═══════════════════════════════════════════════════════════════════
 
+def _has_sufficient_content(post: dict) -> bool:
+    """
+    内容充分性检查：selftext 有实质内容，或评论不为空。
+    纯图片帖（selftext 空 + 无评论）直接过滤。
+    """
+    selftext = (post.get("selftext") or "").strip()
+    comments = post.get("comments") or []
+    return len(selftext) > 20 or len(comments) > 0
+
+
 def _relevance_score(post: dict, keywords: List[str]) -> int:
     """计算帖子与 AI 主题的相关分数（关键词命中数）。"""
     if not keywords:
@@ -656,6 +670,12 @@ def _scrape_subreddit(session: requests.Session, subreddit: str,
             rel = _relevance_score(post, keywords)
             if keywords and rel == 0:
                 continue
+
+            # 内容充分性过滤（纯图片帖跳过）
+            if not _has_sufficient_content(post):
+                logger.info(f"  [过滤] 纯图片帖，跳过: {post['title'][:40]}")
+                continue
+
             post["_relevance"] = rel
             post["subreddit"]  = subreddit
 
@@ -717,7 +737,10 @@ def scrape(config: dict = None) -> List[Dict[str, Any]]:
     cfg = config or CONFIG
     # 支持新的 subreddits 列表，兼容旧的 subreddit 单值
     subreddits = cfg.get("subreddits") or [cfg.get("subreddit", "ThinkingDeeplyAI")]
-    limit       = cfg["limit"]
+    limit_min   = int(cfg.get("limit_min", cfg.get("limit", 5)))
+    limit_max   = int(cfg.get("limit_max", limit_min))
+    limit       = random.randint(limit_min, limit_max)
+    logger.info(f"今日目标：{limit} 条（随机范围 {limit_min}~{limit_max}）")
     proxy       = cfg.get("proxy", "")
     delay       = cfg.get("request_delay", 1.5)
     keywords    = [k.lower() for k in cfg.get("ai_keywords", [])]
