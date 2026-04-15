@@ -126,14 +126,22 @@ def fetch_rss_articles(sources: List[Dict[str, str]],
 
                 summary = ""
                 if hasattr(entry, "summary"):
-                    # 去掉 HTML 标签
                     summary = re.sub(r"<[^>]+>", "", entry.summary or "").strip()
                     summary = re.sub(r"\s+", " ", summary)[:500]
+
+                # 优先使用 RSS 全文（entry.content），避免二次抓取网页
+                rss_full = ""
+                if hasattr(entry, "content") and entry.content:
+                    raw_html = entry.content[0].get("value", "")
+                    rss_full = re.sub(r"<[^>]+>", "", raw_html).strip()
+                    rss_full = re.sub(r"\s+", " ", rss_full)[:8000]
+                    rss_full = re.sub(r"&#\d+;|&\w+;", " ", rss_full)  # 清理 HTML 实体
 
                 articles.append({
                     "title":          entry.get("title", "").strip(),
                     "url":            entry.get("link", ""),
                     "summary":        summary,
+                    "rss_full":       rss_full,   # RSS 全文（可能为空）
                     "source_name":    name,
                     "published_date": pub_date,
                     "read":           False,
@@ -342,10 +350,23 @@ def translate_article(article: Dict[str, Any], api_key: str,
                 "summary_translate_failed title=%r", article["title"][:50]
             )
 
-    # ── 全文翻译（抓取正文后翻译）────────────────────────
+    # ── 全文翻译：RSS全文 → 网页抓取 → 降级为仅摘要 ────────
     if not article.get("zh_content"):
-        content = fetch_article_content(article["url"], session)
+        # 第一选择：RSS feed 自带全文（无需抓网页，最可靠）
+        content = article.get("rss_full", "").strip()
+        source  = "rss_full"
+
+        # 第二选择：抓取网页正文
+        if not content:
+            logger.info("rss_full_empty url=%s — scraping web page", article["url"])
+            content = fetch_article_content(article["url"], session)
+            source  = "web_scrape"
+
         if content:
+            logger.info(
+                "content_source=%s len=%d title=%r",
+                source, len(content), article["title"][:40],
+            )
             zh = _call_claude(
                 content,
                 _TRANSLATE_PROMPT,
@@ -356,11 +377,12 @@ def translate_article(article: Dict[str, Any], api_key: str,
                 article["zh_content"] = zh
             else:
                 logger.warning(
-                    "content_translate_failed title=%r", article["title"][:50]
+                    "content_translate_failed source=%s title=%r",
+                    source, article["title"][:50],
                 )
         else:
-            logger.info(
-                "content_fetch_empty url=%s — falling back to summary only",
+            logger.warning(
+                "content_unavailable url=%s — summary only",
                 article["url"],
             )
 
@@ -383,42 +405,73 @@ def translate_article(article: Dict[str, Any], api_key: str,
 
 def save_article(article: Dict[str, Any], output_dir: str) -> str:
     """
-    保存文章为中英对照 txt 文件，返回文件路径。
+    保存文章为中文 Markdown 笔记，返回文件路径。
+    文件名：{日期}_{中文标题}.md
     """
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
 
-    # 清理文件名中的非法字符
     safe_title = re.sub(r'[\\/:*?"<>|]', "_", article["title"])[:60]
     date_str   = article.get("published_date", datetime.now().strftime("%Y-%m-%d"))
-    filename   = f"{date_str}_{safe_title}.txt"
-    filepath   = os.path.join(output_dir, filename)
+    filename   = f"{date_str}_{safe_title}.md"
+    filepath   = out_path / filename
 
-    lines = [
-        f"标题：{article['title']}",
-        f"Title: {article['title']}",
-        f"来源 / Source：{article['source_name']}",
-        f"原文 / URL：{article['url']}",
-        f"日期 / Date：{date_str}",
-        "─" * 50,
-        "",
-    ]
+    parts: List[str] = []
 
+    # ── 标题与元数据 ──────────────────────────────────
+    zh_title = article.get("zh_summary", "").split("。")[0][:30] if article.get("zh_summary") else ""
+    parts.append(f"# {article['title']}")
+    parts.append("")
+    parts.append(f"| 字段 | 内容 |")
+    parts.append(f"|------|------|")
+    parts.append(f"| 来源 | {article.get('source_name', '')} |")
+    parts.append(f"| 日期 | {date_str} |")
+    parts.append(f"| 原文 | [{article['title']}]({article.get('url', '')}) |")
+    parts.append("")
+
+    # ── 中文摘要 ─────────────────────────────────────
     if article.get("zh_summary"):
-        lines += ["【中文摘要】", article["zh_summary"], ""]
+        parts.append("## 中文摘要")
+        parts.append("")
+        parts.append(article["zh_summary"])
+        parts.append("")
 
-    if article.get("summary"):
-        lines += ["【English Summary】", article["summary"], ""]
-
+    # ── 中文全文翻译 ──────────────────────────────────
     if article.get("zh_content"):
-        lines += ["【中文全文翻译】", article["zh_content"], ""]
+        parts.append("## 中文全文翻译")
+        parts.append("")
+        parts.append(article["zh_content"])
+        parts.append("")
+    else:
+        parts.append("> **提示**：暂无全文翻译。点击「翻译选中」获取完整中文内容。")
+        parts.append("")
 
+    # ── 英文摘要（参考）──────────────────────────────
+    if article.get("summary"):
+        parts.append("## English Summary（参考原文）")
+        parts.append("")
+        parts.append(article["summary"])
+        parts.append("")
+
+    content = "\n".join(parts)
+
+    # 原子写入：先写 .tmp，再重命名
+    tmp = filepath.with_suffix(".tmp")
     try:
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-        logger.info(f"  已保存: {filename}")
-        return filepath
+        tmp.write_text(content, encoding="utf-8")
+        try:
+            tmp.replace(filepath)
+        except OSError:
+            import os as _os
+            _os.replace(str(tmp), str(filepath))
+        logger.info("article_saved filename=%s", filename)
+        return str(filepath)
     except Exception as e:
-        logger.warning(f"保存失败: {e}")
+        logger.warning("save_failed filename=%s error=%s", filename, e)
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
         return ""
 
 
