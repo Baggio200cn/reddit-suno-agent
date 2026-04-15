@@ -5,6 +5,11 @@ seo_scraper.py
 
 依赖：
     pip install requests feedparser beautifulsoup4
+
+工程规范（参见 CLAUDE.md）：
+  - 所有外部调用采用三层错误处理：重试 → 降级 → 跳过并记录
+  - Claude API 输出必须通过质量验证后才写入文章
+  - 每篇文章有明确状态：pending / translating / done / failed
 """
 
 import json
@@ -50,15 +55,23 @@ LEARN_KEYWORDS: List[str] = [
 _CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 _CLAUDE_MODEL   = "claude-haiku-4-5-20251001"
 
+# max_tokens=3000  (full translation)
 _TRANSLATE_PROMPT = (
     "请将以下 SEO 英文教程翻译成中文，保持专业术语准确，"
-    "语言通俗易懂，适合 SEO 新手阅读。直接输出译文，不要解释。\n\n"
+    "语言通俗易懂，适合 SEO 新手阅读。直接输出译文，不要解释。\n\n{text}"
 )
 
+# max_tokens=300  (summary — short)
 _SUMMARIZE_PROMPT = (
     "请用中文写一段100字以内的摘要，概括以下 SEO 英文文章的核心要点，"
-    "适合新手快速了解文章内容。直接输出摘要，不要解释。\n\n"
+    "适合新手快速了解文章内容。直接输出摘要，不要解释。\n\n{text}"
 )
+
+# ── 文章状态常量 ──────────────────────────────────────
+STATUS_PENDING     = "pending"
+STATUS_TRANSLATING = "translating"
+STATUS_DONE        = "done"
+STATUS_FAILED      = "failed"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -125,6 +138,7 @@ def fetch_rss_articles(sources: List[Dict[str, str]],
                     "published_date": pub_date,
                     "read":           False,
                     "translated":     False,
+                    "status":         STATUS_PENDING,
                     "zh_summary":     "",
                     "zh_content":     "",
                 })
@@ -158,10 +172,12 @@ def filter_articles(articles: List[Dict[str, Any]],
 #  文章正文抓取
 # ═══════════════════════════════════════════════════════════════════
 
-def fetch_article_content(url: str, session: requests.Session) -> str:
+def fetch_article_content(url: str, session: requests.Session,
+                          retries: int = 1) -> str:
     """
     抓取文章正文。优先提取 <article> 标签内容，去掉导航/广告/脚本。
     返回纯文本，失败返回空字符串。
+    第一层：重试一次（指数退避）；第二层：返回空字符串（调用方降级为仅摘要翻译）。
     """
     try:
         from bs4 import BeautifulSoup
@@ -169,9 +185,19 @@ def fetch_article_content(url: str, session: requests.Session) -> str:
         logger.error("请先安装 beautifulsoup4：pip install beautifulsoup4")
         return ""
 
+    for attempt in range(retries + 1):
+        try:
+            resp = session.get(url, timeout=30)
+            resp.raise_for_status()
+            break
+        except Exception as e:
+            if attempt < retries:
+                time.sleep(2 ** attempt)
+                continue
+            logger.warning("fetch_content_failed url=%s error=%s", url, e)
+            return ""
+
     try:
-        resp = session.get(url, timeout=30)
-        resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
         # 移除无用标签
@@ -202,7 +228,7 @@ def fetch_article_content(url: str, session: requests.Session) -> str:
         return content[:8000]
 
     except Exception as e:
-        logger.warning(f"抓取正文失败 {url}: {e}")
+        logger.warning("fetch_content_parse_failed url=%s error=%s", url, e)
         return ""
 
 
@@ -210,9 +236,32 @@ def fetch_article_content(url: str, session: requests.Session) -> str:
 #  Claude API 翻译 / 摘要
 # ═══════════════════════════════════════════════════════════════════
 
-def _call_claude(text: str, system_prompt: str, api_key: str,
-                 max_tokens: int = 2000) -> str:
-    """调用 Claude API，返回结果文本，失败返回空字符串。"""
+def _verify_chinese_output(text: str, source: str = "") -> bool:
+    """
+    验证 Claude 输出是否为有效中文译文。
+    规则：
+      1. 非空且长度 ≥ 20 字符
+      2. 包含至少 10 个 CJK 汉字
+      3. 长度不低于原文的 10%（避免截断/拒绝回答）
+    """
+    if not text or len(text) < 20:
+        return False
+    cjk_count = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+    if cjk_count < 10:
+        return False
+    if source and len(text) < len(source) * 0.10:
+        return False
+    return True
+
+
+def _call_claude(text: str, prompt_template: str, api_key: str,
+                 max_tokens: int = 2000, retries: int = 1) -> str:
+    """
+    调用 Claude API，返回结果文本。
+    - 失败自动重试 retries 次（指数退避）
+    - 验证输出质量；如不合格则重试一次（更简短的 prompt）
+    - 最终失败返回空字符串并记录日志
+    """
     if not api_key or not text.strip():
         return ""
     headers = {
@@ -220,22 +269,51 @@ def _call_claude(text: str, system_prompt: str, api_key: str,
         "anthropic-version": "2023-06-01",
         "content-type":      "application/json",
     }
-    payload = {
-        "model":      _CLAUDE_MODEL,
-        "max_tokens": max_tokens,
-        "messages": [{
-            "role":    "user",
-            "content": system_prompt + text,
-        }],
-    }
-    try:
+
+    def _post(prompt: str) -> str:
+        payload = {
+            "model":      _CLAUDE_MODEL,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+        }
         resp = requests.post(_CLAUDE_API_URL, headers=headers,
                              json=payload, timeout=90)
         resp.raise_for_status()
         return resp.json()["content"][0]["text"].strip()
-    except Exception as e:
-        logger.warning(f"Claude API 调用失败: {e}")
-        return ""
+
+    # ── 第一层：重试（网络/限速错误）──────────────────
+    for attempt in range(retries + 1):
+        try:
+            prompt = prompt_template.format(text=text)
+            result = _post(prompt)
+            # ── 第二层：质量验证 ───────────────────────
+            if _verify_chinese_output(result, source=text):
+                return result
+            # 质量不合格：用更简洁的 prompt 重试一次
+            logger.warning(
+                "claude_output_quality_fail attempt=%d len=%d cjk=%d",
+                attempt, len(result),
+                sum(1 for c in result if '\u4e00' <= c <= '\u9fff'),
+            )
+            if attempt == 0:
+                # 重试时换更简单的 prompt
+                simple_prompt = "请用中文翻译以下内容，直接输出译文：\n\n" + text[:4000]
+                result2 = _post(simple_prompt)
+                if _verify_chinese_output(result2, source=text):
+                    return result2
+            break  # 质量两次都不合格，放弃
+        except Exception as e:
+            if attempt < retries:
+                wait = 2 ** attempt
+                logger.warning(
+                    "claude_api_error attempt=%d wait=%ds error=%s",
+                    attempt, wait, e,
+                )
+                time.sleep(wait)
+            else:
+                logger.warning("claude_api_failed error=%s", e)
+
+    return ""
 
 
 def translate_article(article: Dict[str, Any], api_key: str,
@@ -244,24 +322,58 @@ def translate_article(article: Dict[str, Any], api_key: str,
     为文章补充中文摘要和中文翻译。
     - zh_summary：对 RSS summary 做摘要（快，用于列表展示）
     - zh_content：对抓取到的正文做全文翻译（慢，用于深度阅读）
+    - status 字段追踪进度：pending → translating → done / failed
     """
-    logger.info(f"  [翻译] {article['title'][:50]}...")
+    article["status"] = STATUS_TRANSLATING
+    logger.info("translate_start title=%r", article["title"][:50])
 
-    # 中文摘要（基于 RSS summary，无需额外抓取）
-    if article["summary"] and not article["zh_summary"]:
-        article["zh_summary"] = _call_claude(
-            article["summary"], _SUMMARIZE_PROMPT, api_key, max_tokens=300
+    # ── 中文摘要（基于 RSS summary，无需额外抓取）────────
+    if article.get("summary") and not article.get("zh_summary"):
+        zh = _call_claude(
+            article["summary"][:500],
+            _SUMMARIZE_PROMPT,
+            api_key,
+            max_tokens=300,
         )
-
-    # 全文翻译（抓取正文后翻译）
-    if not article["zh_content"]:
-        content = fetch_article_content(article["url"], session)
-        if content:
-            article["zh_content"] = _call_claude(
-                content, _TRANSLATE_PROMPT, api_key, max_tokens=3000
+        if zh:
+            article["zh_summary"] = zh
+        else:
+            logger.warning(
+                "summary_translate_failed title=%r", article["title"][:50]
             )
 
-    article["translated"] = bool(article["zh_summary"] or article["zh_content"])
+    # ── 全文翻译（抓取正文后翻译）────────────────────────
+    if not article.get("zh_content"):
+        content = fetch_article_content(article["url"], session)
+        if content:
+            zh = _call_claude(
+                content,
+                _TRANSLATE_PROMPT,
+                api_key,
+                max_tokens=3000,
+            )
+            if zh:
+                article["zh_content"] = zh
+            else:
+                logger.warning(
+                    "content_translate_failed title=%r", article["title"][:50]
+                )
+        else:
+            logger.info(
+                "content_fetch_empty url=%s — falling back to summary only",
+                article["url"],
+            )
+
+    ok = bool(article.get("zh_summary") or article.get("zh_content"))
+    article["translated"] = ok
+    article["status"]     = STATUS_DONE if ok else STATUS_FAILED
+    logger.info(
+        "translate_end title=%r status=%s zh_summary_len=%d zh_content_len=%d",
+        article["title"][:50],
+        article["status"],
+        len(article.get("zh_summary") or ""),
+        len(article.get("zh_content") or ""),
+    )
     return article
 
 
