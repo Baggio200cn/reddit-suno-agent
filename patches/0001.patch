@@ -1,0 +1,106 @@
+From 96237bd57cbf16d8de811c19cbb26d5a5983f029 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 29 Mar 2026 14:55:40 +0000
+Subject: [PATCH 1/5] =?UTF-8?q?fix:=20=E8=87=AA=E5=8A=A8=E5=8F=91=E7=8E=B0?=
+ =?UTF-8?q?Wiki=E7=A9=BA=E9=97=B4=EF=BC=8C=E6=96=B0=E5=A2=9Elist-spaces?=
+ =?UTF-8?q?=E5=91=BD=E4=BB=A4=E6=9F=A5=E7=9C=8B=E6=AD=A3=E7=A1=AEspace=5Fi?=
+ =?UTF-8?q?d?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+https://claude.ai/code/session_01M7NjhYeN1hPmWXUcpHAjza
+---
+ main.py | 45 +++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 39 insertions(+), 6 deletions(-)
+
+diff --git a/main.py b/main.py
+index 45c016d..3ed6c0d 100644
+--- a/main.py
++++ b/main.py
+@@ -1,6 +1,7 @@
+ """
+ 飞书智能管理 Agent — 主入口
+ 用法:
++  python main.py list-spaces       # 列出所有 Wiki 空间及其 space_id（首次使用先跑这个）
+   python main.py organize          # 扫描两个账号文档 → AI 分类 → 整理到个人 Wiki
+   python main.py organize --dry-run  # 仅预览，不实际移动
+   python main.py import-github     # 将 GitHub 仓库导入飞书
+@@ -43,17 +44,17 @@ def cmd_organize(args):
+ 
+     personal_cfg = config_loader.get_account_config("personal")
+     wiki_space_id = personal_cfg.get("wiki_space_id", "")
+-    if not wiki_space_id:
+-        logger.error("请在 credentials.json 中配置 accounts.personal.wiki_space_id")
+-        sys.exit(1)
+ 
+     all_docs = []
+ 
+-    # 扫描个人账号
++    # 扫描个人账号 — 若 wiki_space_id 不是纯数字则自动发现所有空间
+     logger.info("=== 扫描个人账号文档 ===")
+     personal_client = factory.get_client("personal")
+     personal_scanner = DocScanner(personal_client, "personal")
+-    personal_docs = personal_scanner.scan_wiki(wiki_space_id)
++    scan_space_id = wiki_space_id if wiki_space_id.isdigit() else None
++    if not scan_space_id:
++        logger.info("wiki_space_id 未配置或非数字，自动发现所有 Wiki 空间...")
++    personal_docs = personal_scanner.scan_wiki(scan_space_id)
+     all_docs.extend(personal_docs)
+     logger.info(f"个人账号: {len(personal_docs)} 篇文档")
+ 
+@@ -212,11 +213,41 @@ def _manage_contacts(client, args):
+         print(f"  {c.get('name', '')} — {c.get('email', '')} {c.get('job_title', '')}")
+ 
+ 
++def cmd_list_spaces(_args=None):
++    """列出账号下所有 Wiki 空间及其 space_id"""
++    creds = config_loader.load_credentials()
++    factory = FeishuClientFactory(creds["accounts"])
++    client = factory.get_client("personal")
++
++    try:
++        from lark_oapi.api.wiki.v2 import ListSpaceRequest
++        req = ListSpaceRequest.builder().build()
++        resp = client.wiki.v2.space.list(req)
++        if not resp.success():
++            print(f"获取空间列表失败: {resp.msg}")
++            return
++        spaces = resp.data.items or []
++        if not spaces:
++            print("未找到任何 Wiki 空间（请确认应用已安装并有权限）")
++            return
++        print(f"\n找到 {len(spaces)} 个 Wiki 空间:\n")
++        print(f"{'space_id':<25} {'名称'}")
++        print("-" * 50)
++        for s in spaces:
++            print(f"{s.space_id:<25} {s.name}")
++        print("\n请将正确的 space_id（纯数字）填入 credentials.json 的 wiki_space_id 字段。")
++    except Exception as e:
++        print(f"异常: {e}")
++
++
+ def main():
+     os.makedirs("logs", exist_ok=True)
+     parser = argparse.ArgumentParser(description="飞书智能管理 Agent")
+     subparsers = parser.add_subparsers(dest="command")
+ 
++    # list-spaces 子命令
++    subparsers.add_parser("list-spaces", help="列出所有 Wiki 空间及 space_id（首次使用）")
++
+     # organize 子命令
+     p_organize = subparsers.add_parser("organize", help="扫描文档并整理到个人 Wiki")
+     p_organize.add_argument("--dry-run", action="store_true", help="仅预览，不实际移动文档")
+@@ -232,7 +263,9 @@ def main():
+ 
+     args = parser.parse_args()
+ 
+-    if args.command == "organize":
++    if args.command == "list-spaces":
++        cmd_list_spaces(args)
++    elif args.command == "organize":
+         cmd_organize(args)
+     elif args.command == "import-github":
+         cmd_import_github(args)
+-- 
+2.43.0
