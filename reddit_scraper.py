@@ -254,13 +254,23 @@ def _fetch_rss_posts(session: requests.Session, subreddit: str,
             author = str(entry.author)
         author = author.replace("/u/", "").strip()
 
-        # ── 图片（从 HTML 提取）───────────────────────────
-        img_urls = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', raw_html)
-        img_urls = [u for u in img_urls
-                    if not any(x in u for x in
-                               ("icon", "snoo", "emoji",
-                                "redditstatic.com", "styles.reddit",
-                                "redditmedia.com/t5"))][:3]
+        # ── 图片（从 RSS HTML 提取，需反转义 &amp; → &）─────
+        unescaped_html = html.unescape(raw_html)
+        # 优先取 <img src=...>，再取 preview.redd.it / i.redd.it 的 href
+        _NOISE = ("icon", "snoo", "emoji", "redditstatic.com",
+                  "styles.reddit", "redditmedia.com/t5", "thumbs.redd")
+        img_candidates: List[str] = []
+        for src in re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', unescaped_html):
+            if not any(x in src for x in _NOISE):
+                img_candidates.append(src)
+        # 补充：从 href 里找 Reddit 图片直链（有些帖子只有链接无 img 标签）
+        if not img_candidates:
+            for href in re.findall(r'href=["\']([^"\']+)["\']', unescaped_html):
+                if any(x in href for x in ("i.redd.it", "preview.redd.it",
+                                            "external-preview.redd.it")):
+                    if not any(x in href for x in _NOISE):
+                        img_candidates.append(href)
+        img_urls = img_candidates[:3]
 
         posts.append({
             "id":           post_id,
@@ -387,7 +397,9 @@ def _download_image(session: requests.Session, url: str,
                     output_dir: str, index: int, img_index: int) -> Optional[str]:
     """下载单张图片，返回本地路径，失败返回 None。"""
     try:
-        resp = session.get(url, stream=True, timeout=30)
+        # Reddit 图片 CDN 需要 Referer 头，否则返回 403
+        headers = {"Referer": "https://www.reddit.com/"}
+        resp = session.get(url, stream=True, timeout=30, headers=headers)
         resp.raise_for_status()
 
         # 从 URL 或 Content-Type 确定扩展名
