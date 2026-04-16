@@ -188,69 +188,92 @@ def _make_session(proxy: str, oauth_token: str = "") -> requests.Session:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Reddit API 调用
+#  RSS 抓取（替代 JSON API，无需 OAuth）
 # ═══════════════════════════════════════════════════════════════════
 
-def _fetch_listing(session: requests.Session, endpoint: str,
-                   params: dict = None) -> tuple:
-    """请求 Reddit 列表接口，返回 (children列表, after游标)。"""
-    base = getattr(session, "_reddit_base", _BASE_URL)
-    url  = f"{base}{endpoint}"
-    try:
-        resp = session.get(url, params=params, timeout=20)
-        resp.raise_for_status()
-        data = resp.json().get("data", {})
-        children = data.get("children", [])
-        after = data.get("after")
-        return children, after
-    except requests.exceptions.RequestException as e:
-        logger.error("请求失败 %s: %s", url, e)
-        return [], None
-
-
-def _fetch_single_post(session: requests.Session, post_id: str) -> Optional[dict]:
+def _fetch_rss_posts(session: requests.Session, subreddit: str,
+                     mode: str = "hot") -> List[Dict[str, Any]]:
     """
-    请求单条帖子的完整 JSON（含 media_metadata 和评论）。
-    Reddit 的列表接口(hot.json)不包含 media_metadata，
-    必须通过此接口单独获取 Gallery 图片。
-    返回 (post_data, comments_list)
+    通过 Reddit RSS Feed 抓取帖子列表。
+    mode: hot / new / top  →  对应 /{mode}.rss
+    返回与原 JSON API 兼容的帖子字典列表。
     """
-    base = getattr(session, "_reddit_base", _BASE_URL)
-    url  = f"{base}/comments/{post_id}.json"
     try:
-        resp = session.get(url, params={"limit": 10, "depth": 1}, timeout=20)
+        import feedparser
+    except ImportError:
+        logger.error("请安装 feedparser: pip install feedparser")
+        return []
+
+    url = f"https://www.reddit.com/r/{subreddit}/{mode}.rss"
+    try:
+        resp = session.get(url, timeout=20)
         resp.raise_for_status()
-        data = resp.json()
-        # 响应结构: [帖子列表, 评论列表]
-        post_data = data[0]["data"]["children"][0]["data"]
-        comments_raw = data[1]["data"]["children"] if len(data) > 1 else []
-        return post_data, comments_raw
     except Exception as e:
-        logger.debug(f"获取单帖失败 (id={post_id}): {e}")
-        return None, []
+        logger.error("rss_fetch_failed subreddit=%s url=%s error=%s", subreddit, url, e)
+        return []
 
+    feed = feedparser.parse(resp.content)
+    if not feed.entries:
+        logger.warning("rss_empty subreddit=%s", subreddit)
+        return []
 
-def _extract_top_comments(comments_raw: list, max_comments: int = 3) -> List[str]:
-    """从评论列表中提取热门评论文本（按点赞数排序，过滤掉机器人/删除评论）。"""
-    comments = []
-    for child in comments_raw:
-        if child.get("kind") != "t1":
-            continue
-        d = child.get("data", {})
-        body = d.get("body", "").strip()
-        score = d.get("score", 0)
-        author = d.get("author", "")
-        # 跳过已删除、机器人、太短的评论
-        if not body or body in ("[deleted]", "[removed]"):
-            continue
-        if author in ("AutoModerator", "reddit-bot"):
-            continue
-        if len(body) < 20:
-            continue
-        comments.append((score, html.unescape(body)))
-    # 按点赞数降序，取前 max_comments 条
-    comments.sort(key=lambda x: x[0], reverse=True)
-    return [text for _, text in comments[:max_comments]]
+    now_ts = time.time()
+    posts: List[Dict[str, Any]] = []
+
+    for entry in feed.entries:
+        # ── 帖子 ID（从 URL 中提取 comments/{id}/）──────
+        link  = entry.get("link", "")
+        parts = [p for p in link.rstrip("/").split("/") if p]
+        try:
+            idx     = parts.index("comments")
+            post_id = parts[idx + 1]
+        except (ValueError, IndexError):
+            post_id = re.sub(r"[^a-z0-9]", "", link.split("/")[-2] or link[-8:])
+
+        # ── 发布时间 ──────────────────────────────────────
+        if hasattr(entry, "published_parsed") and entry.published_parsed:
+            created_utc = time.mktime(entry.published_parsed)
+        else:
+            created_utc = now_ts
+
+        # ── 正文（RSS summary 是 HTML，去标签）────────────
+        raw_html  = entry.get("summary", "")
+        selftext  = re.sub(r"<[^>]+>", " ", raw_html)
+        selftext  = re.sub(r"&#\d+;|&\w+;", " ", selftext)
+        selftext  = re.sub(r"\s+", " ", selftext).strip()[:2000]
+
+        # ── 作者 ──────────────────────────────────────────
+        author = ""
+        if hasattr(entry, "author_detail"):
+            author = entry.author_detail.get("name", "")
+        elif hasattr(entry, "author"):
+            author = str(entry.author)
+        author = author.replace("/u/", "").strip()
+
+        # ── 图片（从 HTML 提取）───────────────────────────
+        img_urls = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', raw_html)
+        img_urls = [u for u in img_urls
+                    if not any(x in u for x in ("icon", "snoo", "external-preview", "emoji"))][:3]
+
+        posts.append({
+            "id":           post_id,
+            "title":        html.unescape(entry.get("title", "").strip()),
+            "selftext":     selftext,
+            "url":          link,
+            "score":        1,      # RSS 不提供，设 1 以通过 min_score≥1 门槛
+            "num_comments": 0,
+            "upvote_ratio": 0.9,    # 默认高好评率
+            "created_utc":  created_utc,
+            "created_date": datetime.fromtimestamp(created_utc).strftime("%Y-%m-%d %H:%M"),
+            "author":       author,
+            "comments":     [],
+            "image_urls":   img_urls,
+            "local_images": [],
+            "subreddit":    subreddit,
+        })
+
+    logger.info("rss_fetched subreddit=%s mode=%s count=%d", subreddit, mode, len(posts))
+    return posts
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -665,114 +688,59 @@ def _scrape_subreddit(session: requests.Session, subreddit: str,
                       keywords: List[str], delay: float,
                       strategy: dict, cfg: dict = None) -> List[Dict[str, Any]]:
     """
-    从单个 subreddit 抓取候选帖，经多维评分排序后取 quota 条最优帖子。
-
-    策略 strategy 包含：
-      api_mode         - "hot" / "top" / "new"
-      weights          - 各维度权重 dict
-      min_score        - 最低热度门槛
-      min_upvote_ratio - 最低好评率门槛
-      max_age_hours    - 最大帖子年龄（小时）
+    从单个 subreddit 通过 RSS Feed 抓取候选帖，评分排序后取 quota 条。
+    RSS 不提供 score/upvote_ratio，评分以时效性和关键词相关性为主。
     """
-    api_mode = strategy.get("api_mode", "hot")
-    if api_mode == "top":
-        endpoint    = f"/r/{subreddit}/top.json"
-        base_params = {"limit": 25, "t": "week"}
-    elif api_mode == "new":
-        endpoint    = f"/r/{subreddit}/new.json"
-        base_params = {"limit": 25}
-    else:
-        endpoint    = f"/r/{subreddit}/hot.json"
-        base_params = {"limit": 25}
-
-    min_score   = strategy.get("min_score", 1)
-    min_ratio   = strategy.get("min_upvote_ratio", 0.5)
-    max_age_h   = strategy.get("max_age_hours", 168)
-    weights     = strategy.get("weights", {"score": 0.5, "recency": 0.3, "comments": 0.2, "relevance": 0.0})
-
-    candidates: List[Dict[str, Any]] = []
-    after_cursor = None
+    api_mode  = strategy.get("api_mode", "hot")
+    max_age_h = strategy.get("max_age_hours", 168)
+    # RSS 无点赞数，跳过 min_score / min_upvote_ratio 门槛
+    weights   = strategy.get("weights", {"recency": 0.6, "relevance": 0.4,
+                                          "score": 0.0, "comments": 0.0})
     now_ts = time.time()
 
-    # ── 第一阶段：抓取全部候选帖（最多3页）──────────────
-    for page in range(3):
-        params = dict(base_params)
-        if after_cursor:
-            params["after"] = after_cursor
-
-        logger.info(f"  [{subreddit}] 抓取第{page+1}页（{api_mode}）...")
-        children, after_cursor = _fetch_listing(session, endpoint, params)
-        if not children:
-            break
-
-        for child in children:
-            data    = child.get("data", {})
-            post_id = data.get("id", "")
-            author  = data.get("author", "")
-
-            if post_id in seen_ids:
-                continue
-            if author and author in selected_authors:
-                continue
-
-            post = _extract_post(data, session, delay)
-            if not post:
-                continue
-
-            # 关键词过滤
-            rel = _relevance_score(post, keywords)
-            if keywords and rel == 0:
-                continue
-
-            # 内容充分性过滤（纯图片帖跳过）
-            if not _has_sufficient_content(post):
-                logger.info(f"  [过滤] 纯图片帖，跳过: {post['title'][:40]}")
-                continue
-
-            post["_relevance"] = rel
-            post["subreddit"]  = subreddit
-
-            candidates.append(post)
-
-        if not after_cursor:
-            break
-        time.sleep(delay)
-
-    if not candidates:
-        logger.info(f"  r/{subreddit} 无候选帖")
+    logger.info("  [%s] 通过 RSS 抓取（mode=%s）...", subreddit, api_mode)
+    raw_posts = _fetch_rss_posts(session, subreddit, api_mode)
+    if not raw_posts:
+        logger.warning("  r/%s 无新帖，跳过", subreddit)
         return []
 
-    logger.info(f"  [{subreddit}] 候选帖 {len(candidates)} 条，开始评分筛选...")
-
-    # ── 第二阶段：门槛过滤 + 复合评分 ──────────────────
-    scored: List[Dict[str, Any]] = []
-    for post in candidates:
-        age_h = (now_ts - float(post.get("created_utc", now_ts))) / 3600
-        if post.get("score", 0) < min_score:
+    # ── 过滤：去重 + 年龄 + 关键词 + 内容充分性 ──────────
+    candidates: List[Dict[str, Any]] = []
+    for post in raw_posts:
+        if post["id"] in seen_ids:
             continue
-        if post.get("upvote_ratio", 1.0) < min_ratio:
+        if post["author"] and post["author"] in selected_authors:
             continue
+        age_h = (now_ts - post["created_utc"]) / 3600
         if age_h > max_age_h:
             continue
-        post["_composite"] = _compute_composite_score(post, weights, now_ts)
-        scored.append(post)
+        rel = _relevance_score(post, keywords)
+        if keywords and rel == 0:
+            continue
+        if not _has_sufficient_content(post):
+            logger.info("  [过滤] 纯图片帖，跳过: %s", post["title"][:40])
+            continue
+        post["_relevance"] = rel
+        candidates.append(post)
 
-    if not scored:
-        logger.warning(f"  [{subreddit}] 无帖子通过门槛过滤（min_score={min_score}, "
-                       f"min_ratio={min_ratio}, max_age={max_age_h}h）")
+    if not candidates:
+        logger.info("  r/%s 无候选帖", subreddit)
         return []
 
-    # ── 第三阶段：按评分排序，取前 quota 条 ────────────
-    scored.sort(key=lambda p: p["_composite"], reverse=True)
-    picked = scored[:quota]
+    logger.info("  [%s] 候选帖 %d 条，开始评分...", subreddit, len(candidates))
+
+    # ── 评分排序，取前 quota 条 ───────────────────────────
+    for post in candidates:
+        post["_composite"] = _compute_composite_score(post, weights, now_ts)
+    candidates.sort(key=lambda p: p["_composite"], reverse=True)
+    picked = candidates[:quota]
 
     for post in picked:
         selected_authors.add(post.get("author", ""))
-        # 图片分析 + 视频信息（丰富 selftext）
         if cfg:
             _enrich_selftext(post, cfg, session, delay)
-        cs = post.get("_composite", 0)
-        logger.info(f"  ✅ r/{subreddit} [评分{cs:.2f}] → {post['title'][:50]}")
+        logger.info("  ✅ r/%s [评分%.2f] → %s",
+                    subreddit, post.get("_composite", 0), post["title"][:50])
 
     return picked
 
