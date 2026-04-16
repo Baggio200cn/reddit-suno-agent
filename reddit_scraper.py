@@ -46,6 +46,11 @@ CONFIG = {
     "limit_min": 5,
     "limit_max": 8,
 
+    # Reddit OAuth 凭据（2023年后必须填才能访问 API）
+    # 获取方式：https://www.reddit.com/prefs/apps → create app → script 类型
+    "reddit_client_id":     "",   # app 名称下面那串短 ID
+    "reddit_client_secret": "",   # secret 字段
+
     # 代理（国内用户必须填，留空则直连）
     # 示例："http://127.0.0.1:7890"
     "proxy": "",
@@ -119,20 +124,66 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-_BASE_URL = "https://www.reddit.com"
-_USER_AGENT = "python:reddit-ai-scraper:v2.0 (standalone)"
+_BASE_URL   = "https://www.reddit.com"
+_OAUTH_URL  = "https://oauth.reddit.com"   # OAuth 认证后使用此域名
+_TOKEN_URL  = "https://www.reddit.com/api/v1/access_token"
+_USER_AGENT = "python:reddit-ai-scraper:v2.0 (by /u/anonymous)"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Reddit OAuth（Application-Only，无需用户登录）
+# ═══════════════════════════════════════════════════════════════════
+
+def _fetch_oauth_token(client_id: str, client_secret: str,
+                       proxy: str = "") -> Optional[str]:
+    """
+    申请 Reddit Application-Only OAuth token。
+    返回 access_token 字符串，失败返回 None。
+    """
+    if not client_id or not client_secret:
+        return None
+    proxies = {"http": proxy, "https": proxy} if proxy else {}
+    try:
+        resp = requests.post(
+            _TOKEN_URL,
+            auth=(client_id, client_secret),
+            data={"grant_type": "client_credentials"},
+            headers={"User-Agent": _USER_AGENT},
+            proxies=proxies,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        token = resp.json().get("access_token")
+        if token:
+            logger.info("reddit_oauth=ok token_prefix=%s...", token[:8])
+        return token
+    except Exception as e:
+        logger.warning("reddit_oauth_failed error=%s", e)
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════
 #  HTTP 会话
 # ═══════════════════════════════════════════════════════════════════
 
-def _make_session(proxy: str) -> requests.Session:
+def _make_session(proxy: str, oauth_token: str = "") -> requests.Session:
+    """
+    创建 requests.Session。
+    - 有 oauth_token：使用 oauth.reddit.com + Bearer 认证（2023年后推荐）
+    - 无 oauth_token：匿名请求 www.reddit.com（可能被 403）
+    """
     sess = requests.Session()
     sess.headers.update({"User-Agent": _USER_AGENT})
+    if oauth_token:
+        sess.headers.update({"Authorization": f"Bearer {oauth_token}"})
+        sess._reddit_base = _OAUTH_URL
+        logger.info("session_mode=oauth base=%s", _OAUTH_URL)
+    else:
+        sess._reddit_base = _BASE_URL
+        logger.warning("session_mode=anonymous — may be blocked by Reddit")
     if proxy:
         sess.proxies.update({"http": proxy, "https": proxy})
-        logger.info(f"使用代理: {proxy}")
+        logger.info("proxy=%s", proxy)
     return sess
 
 
@@ -143,16 +194,17 @@ def _make_session(proxy: str) -> requests.Session:
 def _fetch_listing(session: requests.Session, endpoint: str,
                    params: dict = None) -> tuple:
     """请求 Reddit 列表接口，返回 (children列表, after游标)。"""
-    url = f"{_BASE_URL}{endpoint}"
+    base = getattr(session, "_reddit_base", _BASE_URL)
+    url  = f"{base}{endpoint}"
     try:
         resp = session.get(url, params=params, timeout=20)
         resp.raise_for_status()
         data = resp.json().get("data", {})
         children = data.get("children", [])
-        after = data.get("after")  # 下一页游标，None 表示没有更多
+        after = data.get("after")
         return children, after
     except requests.exceptions.RequestException as e:
-        logger.error(f"请求失败 {url}: {e}")
+        logger.error("请求失败 %s: %s", url, e)
         return [], None
 
 
@@ -163,7 +215,8 @@ def _fetch_single_post(session: requests.Session, post_id: str) -> Optional[dict
     必须通过此接口单独获取 Gallery 图片。
     返回 (post_data, comments_list)
     """
-    url = f"{_BASE_URL}/comments/{post_id}.json"
+    base = getattr(session, "_reddit_base", _BASE_URL)
+    url  = f"{base}/comments/{post_id}.json"
     try:
         resp = session.get(url, params={"limit": 10, "depth": 1}, timeout=20)
         resp.raise_for_status()
@@ -767,7 +820,16 @@ def scrape(config: dict = None) -> List[Dict[str, Any]]:
     seen_ids = _load_seen_ids(base_dir)
     logger.info(f"历史记录: {len(seen_ids)} 条已见过的帖子 ID")
 
-    session = _make_session(proxy)
+    # ── Reddit OAuth（推荐，2023年后必须）────────────
+    client_id     = cfg.get("reddit_client_id", "").strip()
+    client_secret = cfg.get("reddit_client_secret", "").strip()
+    oauth_token   = _fetch_oauth_token(client_id, client_secret, proxy)
+    if not oauth_token:
+        logger.warning(
+            "no_oauth_token — 请在设置中填写 Reddit Client ID / Secret"
+            "（参考：https://www.reddit.com/prefs/apps）"
+        )
+    session = _make_session(proxy, oauth_token)
 
     # ── 计算每个社区的配额 ────────────────────────────
     # 例：5条帖子 / 7个社区 → 前5个社区各取1条

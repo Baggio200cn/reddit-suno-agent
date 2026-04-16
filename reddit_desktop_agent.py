@@ -73,9 +73,11 @@ DEFAULT_CONFIG = {
     "proxy":              "",
     "run_time":           "08:00",
     "output_dir":         str(Path.home() / "Desktop" / "Reddit_AI_资讯"),
-    "claude_api_key":     "",   # Claude API Key（留空跳过图片分析）
-    "claude_vision_model": "claude-haiku-4-5-20251001",
-    "strategy":           "trending",  # trending / quality / fresh / hot
+    "claude_api_key":        "",   # Claude API Key（留空跳过图片分析）
+    "claude_vision_model":   "claude-haiku-4-5-20251001",
+    "reddit_client_id":      "",   # Reddit App Client ID
+    "reddit_client_secret":  "",   # Reddit App Client Secret
+    "strategy":              "trending",  # trending / quality / fresh / hot
     "ai_keywords": [
         "llm", "large language model", "agent", "machine learning",
         "claude", "openai", "codex", "deepseek", "kimi", "veo", "gemini",
@@ -404,16 +406,31 @@ class RedditAgentApp:
                  insertbackground=COLORS["text"], relief="flat",
                  font=("Segoe UI", 10)).pack(side="left", padx=(0, 12))
 
-        # 第二行：Claude API Key
+        # 第二行：Reddit OAuth + Claude API Key
         row2 = tk.Frame(f, bg=COLORS["bg"])
         row2.pack(fill="x", padx=8, pady=(0, 4))
-        self._label(row2, "Claude API Key（留空跳过图片分析）：", bg=COLORS["bg"]).pack(side="left")
-        self._claude_key_var = tk.StringVar(value=self.cfg.get("claude_api_key", ""))
-        tk.Entry(row2, textvariable=self._claude_key_var, width=36,
+        self._label(row2, "Reddit Client ID：", bg=COLORS["bg"]).pack(side="left")
+        self._reddit_id_var = tk.StringVar(value=self.cfg.get("reddit_client_id", ""))
+        tk.Entry(row2, textvariable=self._reddit_id_var, width=18,
+                 bg=COLORS["panel"], fg=COLORS["text_hi"],
+                 insertbackground=COLORS["text"], relief="flat",
+                 font=("Segoe UI", 10)).pack(side="left", padx=(0, 12))
+        self._label(row2, "Client Secret：", bg=COLORS["bg"]).pack(side="left")
+        self._reddit_secret_var = tk.StringVar(value=self.cfg.get("reddit_client_secret", ""))
+        tk.Entry(row2, textvariable=self._reddit_secret_var, width=22,
                  bg=COLORS["panel"], fg=COLORS["text_hi"],
                  insertbackground=COLORS["text"], relief="flat",
                  font=("Segoe UI", 10), show="*").pack(side="left", padx=(0, 12))
-        self._btn(row2, "保存", self._save_settings, width=6).pack(side="left")
+
+        row2b = tk.Frame(f, bg=COLORS["bg"])
+        row2b.pack(fill="x", padx=8, pady=(0, 4))
+        self._label(row2b, "Claude API Key（留空跳过图片分析）：", bg=COLORS["bg"]).pack(side="left")
+        self._claude_key_var = tk.StringVar(value=self.cfg.get("claude_api_key", ""))
+        tk.Entry(row2b, textvariable=self._claude_key_var, width=36,
+                 bg=COLORS["panel"], fg=COLORS["text_hi"],
+                 insertbackground=COLORS["text"], relief="flat",
+                 font=("Segoe UI", 10), show="*").pack(side="left", padx=(0, 12))
+        self._btn(row2b, "保存", self._save_settings, width=6).pack(side="left")
 
         # 第三行：抓取策略
         row3 = tk.Frame(f, bg=COLORS["bg"])
@@ -499,8 +516,10 @@ class RedditAgentApp:
                 "request_delay":       1.5,
                 "ai_keywords":         self.cfg.get("ai_keywords", []),
                 "claude_api_key":      self.cfg.get("claude_api_key", ""),
-                "claude_vision_model": self.cfg.get("claude_vision_model", "claude-haiku-4-5-20251001"),
-                "strategy":            strategy,
+                "claude_vision_model":   self.cfg.get("claude_vision_model", "claude-haiku-4-5-20251001"),
+                "reddit_client_id":      self.cfg.get("reddit_client_id", ""),
+                "reddit_client_secret":  self.cfg.get("reddit_client_secret", ""),
+                "strategy":              strategy,
             }
 
             # 重定向 logging 到 GUI 日志
@@ -599,17 +618,23 @@ class RedditAgentApp:
         messagebox.showinfo("✅ 已复制", "结果已复制到剪贴板，可直接粘贴给 Coze！")
 
     def _save_settings(self):
-        self.cfg["run_time"]        = self._time_var.get().strip() or "08:00"
-        self.cfg["proxy"]           = self._proxy_var.get().strip()
-        self.cfg["claude_api_key"]  = self._claude_key_var.get().strip()
-        self.cfg["strategy"]        = self._strategy_var.get()
+        self.cfg["run_time"]               = self._time_var.get().strip() or "08:00"
+        self.cfg["proxy"]                  = self._proxy_var.get().strip()
+        self.cfg["claude_api_key"]         = self._claude_key_var.get().strip()
+        self.cfg["reddit_client_id"]       = self._reddit_id_var.get().strip()
+        self.cfg["reddit_client_secret"]   = self._reddit_secret_var.get().strip()
+        self.cfg["strategy"]               = self._strategy_var.get()
         save_config(self.cfg)
         self._restart_scheduler()
-        has_key = bool(self.cfg.get("claude_api_key"))
-        strategy = self.cfg.get("strategy", "trending")
-        self._log(f"✅ 设置已保存（每天 {self.cfg['run_time']} 运行，"
-                  f"策略：{strategy}，"
-                  f"图片分析：{'开启' if has_key else '关闭（未填API Key）'}）", "ok")
+        has_claude  = bool(self.cfg.get("claude_api_key"))
+        has_reddit  = bool(self.cfg.get("reddit_client_id"))
+        strategy    = self.cfg.get("strategy", "trending")
+        self._log(
+            f"✅ 设置已保存（每天 {self.cfg['run_time']} 运行，策略：{strategy}，"
+            f"Reddit OAuth：{'✓' if has_reddit else '✗ 未填（可能被403）'}，"
+            f"图片分析：{'开启' if has_claude else '关闭'}）",
+            "ok"
+        )
 
     def _register_startup(self):
         ok, msg = register_startup()
