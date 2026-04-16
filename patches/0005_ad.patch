@@ -1,0 +1,69 @@
++        if not self.api_key:
++            for p in posts:
++                p["title_cn"] = p["title"]
++                p["selftext_cn"] = p["selftext"]
++            return posts
++
++        try:
++            import anthropic
++            client = anthropic.Anthropic(api_key=self.api_key)
++        except ImportError:
++            logger.warning("anthropic 未安装，跳过翻译")
++            for p in posts:
++                p["title_cn"] = p["title"]
++                p["selftext_cn"] = p["selftext"]
++            return posts
++
++        for i in range(0, len(posts), 5):
++            self._translate_batch(client, posts[i:i + 5])
++            if i + 5 < len(posts):
++                time.sleep(0.5)
++
++        return posts
++
++    def _translate_batch(self, client, posts: List[Dict]):
++        items_text = []
++        for j, p in enumerate(posts):
++            content = p["title"]
++            if p["selftext"]:
++                content += "\n" + p["selftext"][:400]
++            items_text.append(f"---帖子{j + 1}---\n{content}")
++
++        prompt = (
++            f"请将以下 {len(posts)} 篇 Reddit 帖子翻译成中文。"
++            "保留 AI、LLM、API 等专业缩写。\n"
++            "格式：\n---帖子1---\n标题：<中文标题>\n正文：<中文正文，无正文写"（无正文）">\n"
++            "---帖子2---\n...\n\n原文：\n" + "\n".join(items_text)
++        )
++
++        try:
++            msg = client.messages.create(
++                model=self.model,
++                max_tokens=2000,
++                messages=[{"role": "user", "content": prompt}],
++            )
++            text = msg.content[0].text.strip()
++            sections = [s.strip() for s in re.split(r"---帖子\d+---", text) if s.strip()]
++
++            for j, section in enumerate(sections):
++                if j >= len(posts):
++                    break
++                title_m = re.search(r"标题[：:]\s*(.+)", section)
++                body_m = re.search(r"正文[：:]\s*([\s\S]+)", section)
++
++                posts[j]["title_cn"] = title_m.group(1).strip() if title_m else posts[j]["title"]
++                if body_m:
++                    body = body_m.group(1).strip()
++                    posts[j]["selftext_cn"] = "" if body == "（无正文）" else body
++                else:
++                    posts[j]["selftext_cn"] = posts[j]["selftext"]
++
++        except Exception as e:
++            logger.warning(f"批量翻译失败: {e}")
++            for p in posts:
++                if not p.get("title_cn"):
++                    p["title_cn"] = p["title"]
++                if not p.get("selftext_cn"):
++                    p["selftext_cn"] = p["selftext"]
+-- 
+2.43.0
