@@ -60,13 +60,11 @@ CONFIG_FILE = _DIR / "agent_config.json"
 
 DEFAULT_CONFIG = {
     "subreddits": [
-        "ThinkingDeeplyAI",
+        "AI_Agents",
         "AgentsOfAI",
-        "aiArt",
-        "aivideo",
+        "ThinkingDeeplyAI",
+        "TrueReddit",
         "ClaudeCode",
-        "Teachers",
-        "books",
     ],
     "limit_min":          5,
     "limit_max":          8,

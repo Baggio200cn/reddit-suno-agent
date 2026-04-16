@@ -31,35 +31,31 @@ import requests
 #  ★ 用户配置区（改这里）
 # ─────────────────────────────────────────────
 CONFIG = {
-    # 多社区抓取（每天从不同社区各取1条，提高内容多样性）
+    # 多社区抓取
     "subreddits": [
-        "ThinkingDeeplyAI",
+        "AI_Agents",
         "AgentsOfAI",
-        "aiArt",
-        "aivideo",
+        "ThinkingDeeplyAI",
+        "TrueReddit",
         "ClaudeCode",
-        "Teachers",
-        "books",
     ],
 
-    # 每日抓取数量范围（每次运行随机取范围内的数值）
+    # 每日抓取数量范围
     "limit_min": 5,
     "limit_max": 8,
 
-    # Reddit OAuth 凭据（2023年后必须填才能访问 API）
-    # 获取方式：https://www.reddit.com/prefs/apps → create app → script 类型
-    "reddit_client_id":     "",   # app 名称下面那串短 ID
-    "reddit_client_secret": "",   # secret 字段
+    # Reddit OAuth 凭据（可选，有则更稳定）
+    "reddit_client_id":     "",
+    "reddit_client_secret": "",
 
-    # 代理（国内用户必须填，留空则直连）
-    # 示例："http://127.0.0.1:7890"
+    # 代理（国内用户必须填）示例："http://127.0.0.1:7890"
     "proxy": "",
 
-    # 图片保存目录（留空则保存到脚本同目录下的 output/images/{日期}/）
+    # 图片保存目录
     "output_dir": "",
 
-    # 每次 API 请求之间的间隔（秒），避免触发限流
-    "request_delay": 1.5,
+    # 每次请求间隔（秒）— 适当拉长可降低 503 概率
+    "request_delay": 3.0,
 
     # AI 主题关键词过滤（留空列表则不过滤）
     "ai_keywords": [
@@ -205,12 +201,18 @@ def _fetch_rss_posts(session: requests.Session, subreddit: str,
         return []
 
     url = f"https://www.reddit.com/r/{subreddit}/{mode}.rss"
-    try:
-        resp = session.get(url, timeout=20)
-        resp.raise_for_status()
-    except Exception as e:
-        logger.error("rss_fetch_failed subreddit=%s url=%s error=%s", subreddit, url, e)
-        return []
+    for attempt in range(2):   # 最多重试一次（处理 503）
+        try:
+            resp = session.get(url, timeout=20)
+            resp.raise_for_status()
+            break
+        except Exception as e:
+            if attempt == 0:
+                logger.warning("rss_retry subreddit=%s attempt=1 error=%s", subreddit, e)
+                time.sleep(4)
+                continue
+            logger.error("rss_fetch_failed subreddit=%s url=%s error=%s", subreddit, url, e)
+            return []
 
     feed = feedparser.parse(resp.content)
     if not feed.entries:
@@ -554,6 +556,55 @@ def _get_youtube_info(session: requests.Session, url: str) -> Optional[dict]:
         return None
 
 
+def _fetch_link_content(url: str, session: requests.Session,
+                        retries: int = 1) -> str:
+    """
+    抓取链接帖的外链网页正文（BeautifulSoup）。
+    与 seo_scraper.fetch_article_content 逻辑一致。
+    返回纯文本（≤4000字），失败返回空字符串。
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return ""
+
+    for attempt in range(retries + 1):
+        try:
+            resp = session.get(url, timeout=20)
+            resp.raise_for_status()
+            break
+        except Exception as e:
+            if attempt < retries:
+                time.sleep(2 ** attempt)
+                continue
+            logger.info("link_fetch_failed url=%s error=%s", url[:60], e)
+            return ""
+
+    try:
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "header", "footer",
+                         "aside", "form", "noscript", "iframe"]):
+            tag.decompose()
+        content_el = (
+            soup.find("article") or
+            soup.find(class_=re.compile(
+                r"(post|entry|content|article)[-_]?(body|content|text)?", re.I)) or
+            soup.find("main") or
+            soup.body
+        )
+        if not content_el:
+            return ""
+        lines = []
+        for el in content_el.find_all(["p", "h1", "h2", "h3", "h4", "li"]):
+            text = el.get_text(separator=" ").strip()
+            if len(text) > 30:
+                lines.append(text)
+        return "\n\n".join(lines)[:4000]
+    except Exception as e:
+        logger.info("link_parse_failed url=%s error=%s", url[:60], e)
+        return ""
+
+
 def _enrich_selftext(post: dict, cfg: dict,
                      session: requests.Session, delay: float) -> None:
     """
@@ -592,6 +643,22 @@ def _enrich_selftext(post: dict, cfg: dict,
                 lines.append(f"标题：{info['title']}")
             extra_parts.append("\n".join(lines))
 
+    # ── 链接帖：抓取外链正文（BeautifulSoup）────────────
+    url = post.get("url", "")
+    selftext_now = (post.get("selftext") or "").strip()
+    is_link_post = (
+        url
+        and "reddit.com" not in url
+        and (_is_rss_stub(selftext_now) or len(selftext_now) < 80)
+    )
+    if is_link_post:
+        page_text = _fetch_link_content(url, session)
+        if page_text:
+            post["selftext"] = page_text
+            logger.info("link_content_fetched url=%s len=%d", url[:60], len(page_text))
+        else:
+            logger.info("link_content_empty url=%s", url[:60])
+
     # ── 追加到 selftext ───────────────────────────────
     if extra_parts:
         sep = "\n\n" if post.get("selftext") else ""
@@ -600,17 +667,60 @@ def _enrich_selftext(post: dict, cfg: dict,
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  关键词过滤
+#  广告过滤
 # ═══════════════════════════════════════════════════════════════════
+
+_AD_TITLE_KEYWORDS = [
+    "buy now", "on sale", "discount", "coupon", "promo code", "affiliate",
+    "check out my", "dm me", "click here", "sign up", "subscribe to",
+    "free trial", "limited offer", "get yours", "use code", "sponsored",
+    "i made this", "my app", "my tool", "my product", "my service",
+    "launching", "pre-order", "waitlist",
+]
+_AD_TEXT_KEYWORDS = [
+    "affiliate link", "referral code", "use my link", "earn commission",
+    "not financial advice", "not investment advice",
+]
+
+def _is_ad_post(post: dict) -> bool:
+    """检测广告/自我推广帖子。标题或正文命中广告词即过滤。"""
+    title    = (post.get("title")    or "").lower()
+    selftext = (post.get("selftext") or "").lower()
+    if any(kw in title for kw in _AD_TITLE_KEYWORDS):
+        return True
+    if any(kw in selftext for kw in _AD_TEXT_KEYWORDS):
+        return True
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  关键词过滤 / 内容充分性
+# ═══════════════════════════════════════════════════════════════════
+
+# RSS 链接帖的空内容占位符（BeautifulSoup 抓取后会覆盖）
+_RSS_STUB_RE = re.compile(r"^submitted by /u/\S+", re.I)
+
+def _is_rss_stub(selftext: str) -> bool:
+    """判断是否为 RSS 链接帖的空占位符（非真实正文）。"""
+    return bool(_RSS_STUB_RE.match(selftext.strip()))
+
 
 def _has_sufficient_content(post: dict) -> bool:
     """
-    内容充分性检查：selftext 有实质内容，或评论不为空。
-    纯图片帖（selftext 空 + 无评论）直接过滤。
+    内容充分性检查。
+    - RSS 链接帖的 "submitted by /u/..." 占位符不算内容，但允许通过
+      （后续 _enrich_selftext 会抓取外链正文）
+    - 纯图片帖（真正的空 selftext + 无评论 + 无图片链接）过滤
     """
     selftext = (post.get("selftext") or "").strip()
     comments = post.get("comments") or []
-    return len(selftext) > 20 or len(comments) > 0
+    img_urls = post.get("image_urls") or []
+    url      = post.get("url", "")
+
+    # RSS 链接帖：占位符 + 有外链 → 放行，后续抓取正文
+    if _is_rss_stub(selftext) and url and "reddit.com" not in url:
+        return True
+    return len(selftext) > 20 or len(comments) > 0 or len(img_urls) > 0
 
 
 def _relevance_score(post: dict, keywords: List[str]) -> int:
@@ -704,12 +814,15 @@ def _scrape_subreddit(session: requests.Session, subreddit: str,
         logger.warning("  r/%s 无新帖，跳过", subreddit)
         return []
 
-    # ── 过滤：去重 + 年龄 + 关键词 + 内容充分性 ──────────
+    # ── 过滤：去重 + 广告 + 年龄 + 关键词 + 内容充分性 ──────────
     candidates: List[Dict[str, Any]] = []
     for post in raw_posts:
         if post["id"] in seen_ids:
             continue
         if post["author"] and post["author"] in selected_authors:
+            continue
+        if _is_ad_post(post):
+            logger.info("  [过滤] 广告帖，跳过: %s", post["title"][:40])
             continue
         age_h = (now_ts - post["created_utc"]) / 3600
         if age_h > max_age_h:
@@ -718,7 +831,7 @@ def _scrape_subreddit(session: requests.Session, subreddit: str,
         if keywords and rel == 0:
             continue
         if not _has_sufficient_content(post):
-            logger.info("  [过滤] 纯图片帖，跳过: %s", post["title"][:40])
+            logger.info("  [过滤] 内容不足，跳过: %s", post["title"][:40])
             continue
         post["_relevance"] = rel
         candidates.append(post)
