@@ -1,0 +1,500 @@
++            blocks.append(_text(post["selftext"][:2000]))
++
++        return blocks
++
++    def _build_github_trending_blocks(self, repos: List[Dict], date: str) -> List[Dict]:
++        blocks: List[Dict] = []
++        blocks.append(_text(f"生成时间: {date}  |  共 {len(repos)} 个热门仓库"))
++        blocks.append(_divider())
++
++        for i, repo in enumerate(repos, 1):
++            blocks.append(_h2(f"{i}. {repo['full_name']}"))
++
++            info_parts = [f"⭐ 今日 +{repo.get('stars_today', 0)} stars"]
++            if repo.get("total_stars"):
++                info_parts.append(f"累计 {repo['total_stars']:,} stars")
++            if repo.get("language"):
++                info_parts.append(f"语言: {repo['language']}")
++            blocks.append(_text("  ".join(info_parts)))
++            blocks.append(_text(f"链接: {repo.get('url', '')}"))
++
++            summary = repo.get("summary_cn") or repo.get("description_cn") or repo.get("description", "")
++            if summary:
++                blocks.append(_text(f"简介: {summary}"))
++
++            blocks.append(_divider())
++
++        return blocks
++
++    # ── Wiki 操作 ─────────────────────────────────────────────────────────────
++
++    def _ensure_folder(self, folder_name: str) -> str:
++        """确保文件夹节点存在，返回 node_token"""
++        if folder_name in self._folder_map:
++            return self._folder_map[folder_name]
++
++        from lark_oapi.api.wiki.v2 import CreateSpaceNodeRequest, CreateSpaceNodeRequestBody
++
++        body = (
++            CreateSpaceNodeRequestBody.builder()
++            .obj_type("doc")
++            .node_type("origin")
++            .title(folder_name)
++            .build()
++        )
++        req = (
++            CreateSpaceNodeRequest.builder()
++            .space_id(self.space_id)
++            .request_body(body)
++            .build()
++        )
++        resp = self._client.wiki.v2.space_node.create(req)
++        if not resp.success():
++            raise RuntimeError(f"创建文件夹失败: {resp.msg}")
++
++        token = resp.data.node.node_token
++        self._folder_map[folder_name] = token
++        try:
++            self._db.execute(
++                "INSERT OR IGNORE INTO organizer_folders (node_token, folder_name) VALUES (?, ?)",
++                (token, folder_name),
++            )
++            self._db.commit()
++        except Exception as e:
++            logger.warning(f"文件夹 token 缓存写入失败: {e}")
++
++        logger.info(f"创建文件夹: {folder_name} (token={token})")
++        return token
++
++    def _create_wiki_page(
++        self, title: str, blocks: List[Dict], parent_token: str = ""
++    ) -> Optional[str]:
++        """创建 Wiki 页面节点并写入内容块，返回 node_token"""
++        try:
++            from lark_oapi.api.wiki.v2 import CreateSpaceNodeRequest, CreateSpaceNodeRequestBody
++
++            body_builder = (
++                CreateSpaceNodeRequestBody.builder()
++                .obj_type("doc")
++                .node_type("origin")
++                .title(title)
++            )
++            if parent_token:
++                body_builder.parent_node_token(parent_token)
++
++            req = (
++                CreateSpaceNodeRequest.builder()
++                .space_id(self.space_id)
++                .request_body(body_builder.build())
++                .build()
++            )
++            resp = self._client.wiki.v2.space_node.create(req)
++            if not resp.success():
++                logger.warning(f"创建页面失败: {resp.msg}")
++                return None
++
++            node_token = resp.data.node.node_token
++            obj_token = resp.data.node.obj_token
++
++            if blocks:
++                self._populate_blocks(obj_token, blocks)
++
++            return node_token
++
++        except Exception as e:
++            logger.warning(f"创建页面异常: {e}")
++            return None
++
++    def _populate_blocks(self, document_id: str, blocks: List[Dict]) -> None:
++        try:
++            from lark_oapi.api.docx.v1 import (
++                BatchCreateDocumentBlockChildrenRequest,
++                BatchCreateDocumentBlockChildrenRequestBody,
++            )
++            for i in range(0, len(blocks), 50):
++                batch = blocks[i:i + 50]
++                body = (
++                    BatchCreateDocumentBlockChildrenRequestBody.builder()
++                    .children(batch)
++                    .build()
++                )
++                req = (
++                    BatchCreateDocumentBlockChildrenRequest.builder()
++                    .document_id(document_id)
++                    .block_id(document_id)
++                    .request_body(body)
++                    .build()
++                )
++                resp = self._client.docx.v1.document_block_children.batch_create(req)
++                if not resp.success():
++                    logger.warning(f"写入内容块失败 (batch {i // 50}): {resp.msg}")
++        except Exception as e:
++            logger.warning(f"写入文档内容异常: {e}")
++
++
++# ── Block 工厂函数 ────────────────────────────────────────────────────────────
++
++def _text(content: str) -> Dict:
++    return {"block_type": BLOCK_TEXT, "text": {"elements": [{"text_run": {"content": content}}]}}
++
++def _h1(content: str) -> Dict:
++    return {"block_type": BLOCK_H1, "heading1": {"elements": [{"text_run": {"content": content}}]}}
++
++def _h2(content: str) -> Dict:
++    return {"block_type": BLOCK_H2, "heading2": {"elements": [{"text_run": {"content": content}}]}}
++
++def _h3(content: str) -> Dict:
++    return {"block_type": BLOCK_H3, "heading3": {"elements": [{"text_run": {"content": content}}]}}
++
++def _bullet(content: str) -> Dict:
++    return {"block_type": BLOCK_BULLET, "bullet": {"elements": [{"text_run": {"content": content}}]}}
++
++def _divider() -> Dict:
++    return {"block_type": BLOCK_DIVIDER}
+diff --git a/src/scrapers/github_trending_scraper.py b/src/scrapers/github_trending_scraper.py
+new file mode 100644
+index 0000000..a58f5d9
+--- /dev/null
++++ b/src/scrapers/github_trending_scraper.py
+@@ -0,0 +1,208 @@
++"""
++GitHub Trending 爬虫
++抓取每日热门仓库，使用 Claude API 生成中文摘要
++"""
++import json
++import logging
++import re
++import time
++from typing import Dict, List, Optional
++
++import requests
++
++logger = logging.getLogger(__name__)
++
++TRENDING_URL = "https://github.com/trending"
++HEADERS = {
++    "User-Agent": (
++        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
++        "AppleWebKit/537.36 (KHTML, like Gecko) "
++        "Chrome/120.0.0.0 Safari/537.36"
++    ),
++    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
++    "Accept-Language": "en-US,en;q=0.9",
++}
++
++
++class GitHubTrendingScraper:
++    """抓取 GitHub Trending 热门仓库，可选 Claude 生成中文摘要"""
++
++    def __init__(
++        self,
++        api_key: str = "",
++        model: str = "claude-haiku-4-5-20251001",
++        github_token: str = "",
++    ):
++        self.api_key = api_key
++        self.model = model
++        self.session = requests.Session()
++        self.session.headers.update(HEADERS)
++        if github_token:
++            self.session.headers["Authorization"] = f"token {github_token}"
++
++    def fetch_trending(
++        self,
++        since: str = "daily",
++        language: str = "",
++        top_n: int = 15,
++    ) -> List[Dict]:
++        """
++        抓取 GitHub Trending 页面。
++        since: 'daily' / 'weekly' / 'monthly'
++        language: 语言过滤（空 = 全部）
++        top_n: 最多返回几个仓库
++        """
++        try:
++            from bs4 import BeautifulSoup
++        except ImportError:
++            raise ImportError("请安装 beautifulsoup4: pip install beautifulsoup4")
++
++        params: Dict[str, str] = {"since": since}
++        if language:
++            params["l"] = language
++
++        try:
++            resp = self.session.get(TRENDING_URL, params=params, timeout=20)
++            resp.raise_for_status()
++        except Exception as e:
++            logger.error(f"抓取 GitHub Trending 失败: {e}")
++            return []
++
++        soup = BeautifulSoup(resp.text, "html.parser")
++        repos: List[Dict] = []
++
++        for article in soup.select("article.Box-row"):
++            repo = self._parse_repo(article)
++            if repo:
++                repos.append(repo)
++                if len(repos) >= top_n:
++                    break
++
++        logger.info(f"GitHub Trending 抓取到 {len(repos)} 个仓库")
++        return repos
++
++    def _parse_repo(self, article) -> Optional[Dict]:
++        try:
++            h2 = article.select_one("h2 a")
++            if not h2:
++                return None
++
++            href = h2.get("href", "").strip("/")
++            parts = href.split("/")
++            if len(parts) != 2:
++                return None
++            owner, name = parts[0].strip(), parts[1].strip()
++            full_name = f"{owner}/{name}"
++
++            desc_el = article.select_one("p")
++            description = desc_el.get_text(strip=True) if desc_el else ""
++
++            lang_el = article.select_one("span[itemprop='programmingLanguage']")
++            language = lang_el.get_text(strip=True) if lang_el else ""
++
++            # 今日 stars
++            stars_today = 0
++            for span in article.select("span.d-inline-block"):
++                text = span.get_text(strip=True)
++                if "star" in text.lower():
++                    m = re.search(r"([\d,]+)", text)
++                    if m:
++                        stars_today = int(m.group(1).replace(",", ""))
++                    break
++
++            # 总 stars
++            total_stars = 0
++            for a_tag in article.select("a"):
++                if a_tag.get("href", "").endswith("/stargazers"):
++                    m = re.search(r"([\d,]+)", a_tag.get_text(strip=True))
++                    if m:
++                        total_stars = int(m.group(1).replace(",", ""))
++                    break
+
++            return {
++                "full_name": full_name,
++                "owner": owner,
++                "name": name,
++                "url": f"https://github.com/{full_name}",
++                "description": description,
++                "language": language,
++                "stars_today": stars_today,
++                "total_stars": total_stars,
++                "description_cn": "",
++                "summary_cn": "",
++            }
++        except Exception as e:
++            logger.warning(f"解析仓库条目失败: {e}")
++            return None
++
++    # ── 摘要生成 ──────────────────────────────────────────────────────────────
++
++    def generate_summaries(self, repos: List[Dict]) -> List[Dict]:
++        """批量为仓库生成中文摘要（每批 5 个）"""
++        if not self.api_key or not repos:
++            for r in repos:
++                r["description_cn"] = r.get("description", "")
++                r["summary_cn"] = r.get("description", "（暂无摘要）")
++            return repos
++
++        try:
++            import anthropic
++            client = anthropic.Anthropic(api_key=self.api_key)
++        except ImportError:
++            logger.warning("anthropic 未安装，跳过摘要生成")
++            for r in repos:
++                r["description_cn"] = r.get("description", "")
++                r["summary_cn"] = r.get("description", "")
++            return repos
++
++        for i in range(0, len(repos), 5):
++            self._summarize_batch(client, repos[i:i + 5])
++            if i + 5 < len(repos):
++                time.sleep(0.5)
++
++        return repos
++
++    def _summarize_batch(self, client, repos: List[Dict]):
++        items = []
++        for j, r in enumerate(repos):
++            items.append(
++                f"{j + 1}. [{r['full_name']}] {r.get('description', '')} "
++                f"(语言: {r.get('language', 'N/A')}, 今日star: {r.get('stars_today', 0)})"
++            )
++
++        prompt = (
++            f"你是技术专家，请为以下 {len(repos)} 个 GitHub 热门仓库生成简洁中文简介（每个 30-60 字）。"
++            "包含：功能定位、主要特点、适用场景。保留 AI、LLM、API 等专业术语。\n\n"
++            "仓库列表：\n" + "\n".join(items) + "\n\n"
++            "请严格按以下 JSON 格式返回，不要其他文字：\n"
++            '[{"index": 1, "description_cn": "...", "summary_cn": "..."}, ...]'
++        )
+
++        try:
++            msg = client.messages.create(
++                model=self.model,
++                max_tokens=1500,
++                messages=[{"role": "user", "content": prompt}],
++            )
++            text = msg.content[0].text.strip()
++            text = re.sub(r"^```(?:json)?\s*", "", text)
++            text = re.sub(r"\s*```$", "", text)
++
++            data = json.loads(text)
++            for item in data:
++                idx = item.get("index", 0) - 1
++                if 0 <= idx < len(repos):
++                    repos[idx]["description_cn"] = item.get(
++                        "description_cn", repos[idx].get("description", "")
++                    )
++                    repos[idx]["summary_cn"] = item.get(
++                        "summary_cn", repos[idx].get("description", "")
++                    )
++
++        except Exception as e:
++            logger.warning(f"批量摘要生成失败: {e}")
++            for r in repos:
++                if not r.get("description_cn"):
++                    r["description_cn"] = r.get("description", "")
++                if not r.get("summary_cn"):
++                    r["summary_cn"] = r.get("description", "（暂无摘要）")
+diff --git a/src/scrapers/reddit_scraper.py b/src/scrapers/reddit_scraper.py
+new file mode 100644
+index 0000000..f38761c
+--- /dev/null
++++ b/src/scrapers/reddit_scraper.py
+@@ -0,0 +1,194 @@
++"""
++Reddit r/AI_Agents 爬虫
++抓取 new + hot 帖子，使用 Claude API 翻译成中文
++"""
++import html
++import logging
++import re
++import time
++from datetime import datetime
++from typing import Dict, List, Optional
++
++import requests
++
++logger = logging.getLogger(__name__)
++
++SUBREDDIT = "AI_Agents"
++BASE_URL = f"https://www.reddit.com/r/{SUBREDDIT}"
++HEADERS = {
++    "User-Agent": "Mozilla/5.0 (compatible; feishu-agent/1.0)",
++    "Accept": "application/json",
++}
++
++
++class RedditScraper:
++    """抓取 r/AI_Agents 最新和热门帖子，可选 Claude 翻译"""
++
++    def __init__(self, api_key: str = "", model: str = "claude-haiku-4-5-20251001"):
++        self.api_key = api_key
++        self.model = model
++        self.session = requests.Session()
++        self.session.headers.update(HEADERS)
++
++    def fetch_posts(self, limit: int = 20) -> List[Dict]:
++        """抓取 new + hot 帖子，按帖子 ID 去重后返回"""
++        new_posts = self._fetch_sort("new", limit)
++        hot_posts = self._fetch_sort("hot", limit)
++
++        seen_ids: set = set()
++        all_posts: List[Dict] = []
++        for post in new_posts + hot_posts:
++            pid = post.get("id", "")
++            if pid and pid not in seen_ids:
++                seen_ids.add(pid)
++                all_posts.append(post)
++
++        logger.info(
++            f"r/{SUBREDDIT}: 共 {len(all_posts)} 篇不重复帖子 "
++            f"(new={len(new_posts)}, hot={len(hot_posts)})"
++        )
++        return all_posts
+
++    def _fetch_sort(self, sort: str, limit: int) -> List[Dict]:
++        url = f"{BASE_URL}/{sort}.json"
++        try:
++            resp = self.session.get(url, params={"limit": limit}, timeout=15)
++            resp.raise_for_status()
++            data = resp.json()
++            posts = []
++            for child in data.get("data", {}).get("children", []):
++                d = child.get("data", {})
++                post = self._parse_post(d)
++                if post:
++                    posts.append(post)
++            return posts
++        except Exception as e:
++            logger.warning(f"抓取 r/{SUBREDDIT}/{sort} 失败: {e}")
++            return []
++
++    def _parse_post(self, d: Dict) -> Optional[Dict]:
++        title = d.get("title", "").strip()
++        if not title:
++            return None
++
++        selftext = d.get("selftext", "").strip()
++        if selftext in ("[removed]", "[deleted]"):
++            selftext = ""
++
++        return {
++            "id": d.get("id", ""),
++            "title": title,
++            "title_cn": "",
++            "selftext": selftext,
++            "selftext_cn": "",
++            "url": d.get("url", ""),
++            "permalink": "https://www.reddit.com" + d.get("permalink", ""),
++            "score": d.get("score", 0),
++            "num_comments": d.get("num_comments", 0),
++            "author": d.get("author", ""),
++            "created_utc": d.get("created_utc", 0),
++            "images": self._extract_images(d),
++            "flair": d.get("link_flair_text", ""),
++        }
++
++    def _extract_images(self, d: Dict) -> List[str]:
++        images: List[str] = []
++
++        # 方法1: preview.images
++        for img in d.get("preview", {}).get("images", []):
++            url = img.get("source", {}).get("url", "")
++            if url:
++                images.append(html.unescape(url))
++
++        # 方法2: 帖子本身是图片链接
++        post_url = d.get("url", "")
++        if d.get("post_hint") == "image" or any(
++            post_url.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp")
++        ):
++            if post_url not in images:
++                images.append(post_url)
++
++        # 方法3: gallery
++        if d.get("is_gallery") and d.get("gallery_data"):
++            media_meta = d.get("media_metadata", {})
++            for item in d["gallery_data"].get("items", []):
++                mid = item.get("media_id", "")
++                meta = media_meta.get(mid, {})
++                if meta.get("e") == "Image":
++                    src = meta.get("s", {}).get("u", "")
++                    if src:
++                        images.append(html.unescape(src))
++
++        return images[:3]
++
++    # ── 翻译 ─────────────────────────────────────────────────────────────────
++
++    def translate_posts(self, posts: List[Dict]) -> List[Dict]:
++        """批量翻译帖子标题和正文（每批 5 篇）"""
