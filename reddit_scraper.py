@@ -38,6 +38,8 @@ CONFIG = {
         "ThinkingDeeplyAI",
         "TrueReddit",
         "ClaudeCode",
+        "aiArt",       # AI 绘画作品（有图）
+        "aivideo",     # AI 视频作品（有图）
     ],
 
     # 每日抓取数量范围
@@ -255,7 +257,10 @@ def _fetch_rss_posts(session: requests.Session, subreddit: str,
         # ── 图片（从 HTML 提取）───────────────────────────
         img_urls = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', raw_html)
         img_urls = [u for u in img_urls
-                    if not any(x in u for x in ("icon", "snoo", "external-preview", "emoji"))][:3]
+                    if not any(x in u for x in
+                               ("icon", "snoo", "emoji",
+                                "redditstatic.com", "styles.reddit",
+                                "redditmedia.com/t5"))][:3]
 
         posts.append({
             "id":           post_id,

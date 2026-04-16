@@ -65,6 +65,8 @@ DEFAULT_CONFIG = {
         "ThinkingDeeplyAI",
         "TrueReddit",
         "ClaudeCode",
+        "aiArt",
+        "aivideo",
     ],
     "limit_min":          5,
     "limit_max":          8,
