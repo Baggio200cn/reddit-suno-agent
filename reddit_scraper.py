@@ -127,6 +127,74 @@ _OAUTH_URL  = "https://oauth.reddit.com"   # OAuth 认证后使用此域名
 _TOKEN_URL  = "https://www.reddit.com/api/v1/access_token"
 _USER_AGENT = "python:reddit-ai-scraper:v2.0 (by /u/anonymous)"
 
+# RSS/HTML 图片提取常量
+# preview.redd.it 是 Reddit 压缩版（≤640px，重编码），i.redd.it 才是原图
+_REDDIT_CDN_RE = re.compile(
+    r'https?://(?:preview|i|external-preview)\.redd\.it/([\w-]+)\.([a-zA-Z]{3,4})',
+    re.IGNORECASE,
+)
+_IMG_NOISE = (
+    "icon", "snoo", "emoji", "redditstatic.com",
+    "styles.reddit", "redditmedia.com/t5", "thumbs.redd",
+    "award_images",
+)
+_MAX_IMAGES_PER_POST = 6
+
+
+def _upgrade_reddit_image_url(url: str) -> str:
+    """把 Reddit 压缩预览 URL 升级到 i.redd.it 原图 URL。
+
+    preview.redd.it/abc.jpg?width=640&format=pjpg  →  https://i.redd.it/abc.jpg
+    external-preview.redd.it/xxx.jpg?...           →  https://i.redd.it/xxx.jpg
+    非 Reddit 托管图片：保持原样返回。
+    """
+    if not url:
+        return url
+    match = _REDDIT_CDN_RE.search(url)
+    if not match:
+        return url
+    media_id = match.group(1)
+    ext = match.group(2).lower()
+    if ext == "jpeg":
+        ext = "jpg"
+    return f"https://i.redd.it/{media_id}.{ext}"
+
+
+def _extract_rss_image_urls(html_content: str,
+                            max_images: int = _MAX_IMAGES_PER_POST
+                            ) -> List[str]:
+    """从 RSS HTML 片段提取去重后的高分辨率图片 URL。
+
+    同时扫描 <img src=...> 和 <a href=...>（gallery 帖往往只有 href），
+    对 preview.redd.it 自动升级为 i.redd.it 原图。
+    """
+    urls: List[str] = []
+    seen: set = set()
+
+    def _add(candidate: str) -> None:
+        if not candidate or any(n in candidate for n in _IMG_NOISE):
+            return
+        upgraded = _upgrade_reddit_image_url(candidate)
+        if upgraded not in seen:
+            seen.add(upgraded)
+            urls.append(upgraded)
+
+    # 1) <img src="..."> 标签（RSS 通常嵌入 preview.redd.it 压缩图，会被升级）
+    for src in re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', html_content):
+        if len(urls) >= max_images:
+            break
+        _add(src)
+
+    # 2) <a href="..."> 指向 Reddit CDN 的链接（gallery 多图、纯链接帖）
+    for href in re.findall(r'href=["\']([^"\']+)["\']', html_content):
+        if len(urls) >= max_images:
+            break
+        if any(x in href for x in ("i.redd.it", "preview.redd.it",
+                                    "external-preview.redd.it")):
+            _add(href)
+
+    return urls
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Reddit OAuth（Application-Only，无需用户登录）
@@ -254,23 +322,13 @@ def _fetch_rss_posts(session: requests.Session, subreddit: str,
             author = str(entry.author)
         author = author.replace("/u/", "").strip()
 
-        # ── 图片（从 RSS HTML 提取，需反转义 &amp; → &）─────
-        unescaped_html = html.unescape(raw_html)
-        # 优先取 <img src=...>，再取 preview.redd.it / i.redd.it 的 href
-        _NOISE = ("icon", "snoo", "emoji", "redditstatic.com",
-                  "styles.reddit", "redditmedia.com/t5", "thumbs.redd")
-        img_candidates: List[str] = []
-        for src in re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', unescaped_html):
-            if not any(x in src for x in _NOISE):
-                img_candidates.append(src)
-        # 补充：从 href 里找 Reddit 图片直链（有些帖子只有链接无 img 标签）
-        if not img_candidates:
-            for href in re.findall(r'href=["\']([^"\']+)["\']', unescaped_html):
-                if any(x in href for x in ("i.redd.it", "preview.redd.it",
-                                            "external-preview.redd.it")):
-                    if not any(x in href for x in _NOISE):
-                        img_candidates.append(href)
-        img_urls = img_candidates[:3]
+        # ── 图片：从 RSS HTML 提取高分辨率图片 URL ─────
+        # 用 _extract_rss_image_urls 统一处理：
+        #   - 反转义 &amp; → &
+        #   - 合并 <img src=...> 与 <a href=...>（gallery 帖关键）
+        #   - preview.redd.it → i.redd.it 自动升级到原图
+        #   - 去重 + 上限 _MAX_IMAGES_PER_POST
+        img_urls = _extract_rss_image_urls(html.unescape(raw_html))
 
         posts.append({
             "id":           post_id,
