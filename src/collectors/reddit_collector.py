@@ -151,21 +151,25 @@ class RedditCollector:
             return "self"
         return "link"
 
-    def _extract_image_urls(self, data: dict) -> List[str]:
-        """从帖子 data 中提取图片 URL（最多3张）"""
-        urls = []
+    @staticmethod
+    def _is_image_url(url: str) -> bool:
+        """判断 URL 是否直接指向图片文件"""
+        clean = url.lower().split("?")[0]
+        return clean.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"))
+
+    def _extract_image_urls(self, data: dict, max_per_post: int = 5) -> List[str]:
+        """从帖子 data 中提取高分辨率图片 URL"""
+        urls: List[str] = []
         try:
-            post_hint = data.get("post_hint", "")
+            # 0. 转发帖：从原帖提取
+            crosspost_list = data.get("crosspost_parent_list")
+            if crosspost_list:
+                parent_urls = self._extract_image_urls(crosspost_list[0], max_per_post)
+                if parent_urls:
+                    return parent_urls
 
-            # 1. 直接图片帖
-            if post_hint == "image":
-                url = data.get("url", "")
-                if url:
-                    urls.append(url)
-
-            # 2. 图片集（gallery）
+            # 1. Gallery（图集）— 构造 i.redd.it 原图 URL
             if data.get("is_gallery") and data.get("media_metadata"):
-                # gallery_data.items 保留顺序
                 gallery_order = []
                 if data.get("gallery_data") and data["gallery_data"].get("items"):
                     gallery_order = [
@@ -176,26 +180,38 @@ class RedditCollector:
                     gallery_order = list(data["media_metadata"].keys())
 
                 for media_id in gallery_order:
-                    if len(urls) >= 3:
+                    if len(urls) >= max_per_post:
                         break
                     item = data["media_metadata"].get(media_id, {})
-                    if item.get("status") == "valid" and "s" in item:
-                        raw_url = item["s"].get("u", "")
-                        if raw_url:
-                            urls.append(html.unescape(raw_url))
+                    if item.get("status") != "valid":
+                        continue
+                    mime = item.get("m", "image/jpg")
+                    ext = mime.split("/")[-1] if "/" in mime else "jpg"
+                    if ext == "jpeg":
+                        ext = "jpg"
+                    urls.append(f"https://i.redd.it/{media_id}.{ext}")
+                return urls[:max_per_post]
 
-            # 3. 预览图（link 帖 / self 帖中嵌入图片）
-            if not urls and "preview" in data:
-                try:
-                    raw_url = data["preview"]["images"][0]["source"]["url"]
-                    urls.append(html.unescape(raw_url))
-                except (KeyError, IndexError):
-                    pass
+            # 2. 直接图片 — 优先 url_overridden_by_dest，其次 url
+            for key in ("url_overridden_by_dest", "url"):
+                candidate = data.get(key, "")
+                if candidate and self._is_image_url(candidate):
+                    urls.append(candidate)
+                    break
+
+            # 3. 预览图兜底（外部链接帖等无法拿原图时）
+            if not urls and data.get("preview", {}).get("images"):
+                for img in data["preview"]["images"]:
+                    if len(urls) >= max_per_post:
+                        break
+                    source_url = img.get("source", {}).get("url", "")
+                    if source_url:
+                        urls.append(html.unescape(source_url))
 
         except Exception as e:
             logger.debug(f"提取图片 URL 时出现异常（已忽略）: {e}")
 
-        return urls[:3]
+        return urls[:max_per_post]
 
 
 if __name__ == "__main__":

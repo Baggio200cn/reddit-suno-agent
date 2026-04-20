@@ -133,7 +133,7 @@ class RedditSunoAgent:
 
             # 1. 搜集 Reddit 帖子
             logger.info("步骤 1/7: 搜集 Reddit 帖子...")
-            posts = self.reddit_collector.collect_hot_posts("ThinkingDeeplyAI", limit=5)
+            posts = self.reddit_collector.collect_hot_posts("ThinkingDeeplyAI", limit=6)
             if not posts:
                 raise Exception("未能收集到任何帖子")
 
